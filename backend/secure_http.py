@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import os
 import socket
 import ssl
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import urlsplit
+
+from logger_config import get_logger
+
+logger = get_logger("secure_http")
 
 
 class SecureHttpError(RuntimeError):
@@ -73,6 +80,142 @@ def resolve_public(host: str, port: int) -> list[str]:
     return addresses
 
 
+# ---------------------------------------------------------------------------
+# 代理支持
+#
+# 与 source_fetcher.py 同理:本机配置了 fake-ip 代理(如 Clash/Surge 增强模式)
+# 时,socket.getaddrinfo 会把外部域名解析到 198.18.0.0/15 等基准测试网段,
+# 被 is_public_ip 判定为保留地址而拒绝连接。
+#
+# 当探测到本机 HTTP/HTTPS 代理时,改走 urllib + ProxyHandler:由代理负责
+# CONNECT 隧道与域名解析,绕开 fake-ip。URL 层面的安全校验(scheme/port/
+# hostname)仍然执行,只是跳过本地 DNS 解析和 IP 钉扎。
+# ---------------------------------------------------------------------------
+
+
+def _candidate_proxies() -> list[str]:
+    """收集候选代理地址,顺序:环境变量 > macOS 系统配置 > getproxies。"""
+    result: list[str] = []
+    env_proxy = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if env_proxy:
+        result.append(env_proxy)
+    sysconf = getattr(urllib.request, "getproxies_macosx_sysconf", None)
+    sources: list = []
+    if sysconf:
+        try:
+            sources.append(sysconf())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        sources.append(urllib.request.getproxies())
+    except Exception:  # noqa: BLE001
+        pass
+    for prox in sources:
+        for key in ("https", "http"):
+            value = prox.get(key) if isinstance(prox, dict) else None
+            if value and value not in result:
+                result.append(value)
+    return result
+
+
+def _has_proxy() -> bool:
+    return bool(_candidate_proxies())
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止自动跟随重定向,由调用方决定是否拒绝。"""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: D401, ANN002
+        return None
+
+
+def _request_via_proxy(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: Mapping[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = 30,
+    max_bytes: int = 4_000_000,
+    reject_redirects: bool = True,
+) -> SecureHttpResponse:
+    """经由本地 HTTP 代理发送请求,由代理负责 DNS 解析和 CONNECT 隧道。"""
+    proxies = _candidate_proxies()
+    if not proxies:
+        raise SecureHttpError("connection_failed", "未配置代理且无法直连外部服务")
+
+    ssl_context = ssl.create_default_context()
+    ssl_context.load_default_certs()
+    last_error: Exception | None = None
+
+    for proxy in proxies:
+        try:
+            handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(
+                handler,
+                _NoRedirectHandler,
+                urllib.request.HTTPSHandler(context=ssl_context),
+            )
+            req = urllib.request.Request(url, method=method.upper(), data=body)
+            for key, value in (headers or {}).items():
+                req.add_header(key, value)
+            try:
+                resp = opener.open(req, timeout=timeout)
+                status = resp.status
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            except urllib.error.HTTPError as http_error:
+                status = http_error.code
+                resp_headers = {k.lower(): v for k, v in (http_error.headers.items() if http_error.headers else [])}
+                resp = http_error
+
+            # 重定向拦截
+            if 300 <= status < 400 and reject_redirects:
+                raise SecureHttpError(
+                    "redirect_forbidden",
+                    "外部服务返回重定向，已阻止携带凭证继续请求",
+                    status=status,
+                    location=resp_headers.get("location", ""),
+                )
+
+            # 读取响应体(带大小限制)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(min(65536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise SecureHttpError("response_too_large", "外部服务响应超过安全大小限制")
+
+            peer_ip = ""
+            try:
+                # 尝试获取真实对端 IP（可能不可用）
+                if hasattr(resp, "fp") and hasattr(resp.fp, "raw"):
+                    sock = getattr(resp.fp.raw, "_sock", None)
+                    if sock:
+                        peer_ip = sock.getpeername()[0]
+            except Exception:  # noqa: BLE001
+                pass
+
+            return SecureHttpResponse(status, resp_headers, b"".join(chunks), peer_ip)
+
+        except SecureHttpError:
+            raise
+        except (urllib.error.URLError, OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+            logger.warning("代理请求失败 (proxy=%s): %s", proxy, exc)
+            continue
+
+    raise SecureHttpError("connection_failed", f"无法经代理连接外部服务：{last_error}") from last_error
+
+
 def request_bytes(
     url: str,
     *,
@@ -93,6 +236,21 @@ def request_bytes(
     port = parsed.port or (443 if scheme == "https" else 80)
     if port not in ({443} if require_https else {80, 443}):
         raise SecureHttpError("unsafe_port", "外部服务端口不在允许范围")
+
+    # 代理路径:当检测到本机 HTTP/HTTPS 代理时,由代理负责 DNS 解析和 CONNECT 隧道,
+    # 绕开 fake-ip 导致的 unsafe_address 误拦截。URL 层面的安全校验已在上方完成。
+    if _has_proxy():
+        logger.info("检测到代理配置,通过代理发送请求: %s", parsed.hostname)
+        return _request_via_proxy(
+            url,
+            method=method,
+            headers=headers,
+            body=body,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            reject_redirects=reject_redirects,
+        )
+
     addresses = resolve_public(parsed.hostname, port)
     path = parsed.path or "/"
     if parsed.query:

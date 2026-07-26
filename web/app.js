@@ -38,6 +38,7 @@ const state = {
   logsFilter: { level: 'ALL', q: '' },
   logsAutoRefresh: true,
   logsPollTimer: null,
+  bodyMode: 'edit', // 'edit' | 'preview'
 };
 
 const ROUTES = {
@@ -321,7 +322,7 @@ function timelineHtml(task) {
   return `<div class="timeline">${steps.map(([key, label]) => {
     const index = order.indexOf(key);
     const wasSkipped = skipped.has(key);
-    const done = !wasSkipped && (executed.has(key) || task.status === 'succeeded' && index < order.length);
+    const done = !wasSkipped && (executed.has(key) || task.status === 'succeeded' || (index < currentIndex && ['queued', 'running'].includes(task.status)));
     const active = key === task.currentStep && ['queued', 'running'].includes(task.status);
     const error = key === task.currentStep && ['failed', 'timeout', 'blocked', 'cancelled'].includes(task.status);
     const cls = wasSkipped ? 'skipped' : done ? 'done' : active ? 'active' : error ? 'error' : '';
@@ -401,8 +402,11 @@ function renderWorkspace() {
           ${project.outline?.length ? `<ol class="outline-list">${project.outline.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ol>` : '<div class="empty"><strong>尚无框架</strong><span>任务完成后会显示文章框架。</span></div>'}
         </section>
         <section class="card card-pad">
-          <div class="section-title"><div><h3>正文编辑</h3><p>标题、摘要、正文和封面任一变化都会使终审失效。</p></div><span class="helper">revision ${project.revision}</span></div>
-          <textarea class="editor autosave" id="project-body" data-field="bodyMarkdown" maxlength="500000" placeholder="正文将在这里生成，也可以直接手工写作。">${escapeHtml(project.bodyMarkdown)}</textarea>
+          <div class="section-title"><div><h3>正文编辑</h3><p>标题、摘要、正文和封面任一变化都会使终审失效。</p></div><div class="body-mode-switch"><span class="helper" style="margin-right:8px">revision ${project.revision}</span><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'edit' ? 'active' : ''}" id="body-mode-edit">编辑</button><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'preview' ? 'active' : ''}" id="body-mode-preview">预览</button></div></div>
+          ${state.bodyMode === 'edit'
+            ? `<textarea class="editor autosave" id="project-body" data-field="bodyMarkdown" maxlength="500000" placeholder="正文将在这里生成，也可以直接手工写作。">${escapeHtml(project.bodyMarkdown)}</textarea>`
+            : `<div class="body-preview-wrap">${previewCurrent ? `<div class="rich-preview body-preview-content">${state.preview.html}</div>` : '<div class="empty"><strong>暂无预览</strong><span>保存后点击"预览"按钮查看渲染效果。</span></div>'}</div>`
+          }
         </section>
         <section class="card card-pad">
           <div class="section-title"><div><h3>发布前审校</h3><p>只能终审已完成保存且与服务端指纹一致的当前 revision。</p></div></div>
@@ -955,6 +959,17 @@ function bindWorkspace() {
   document.getElementById('task-retry')?.addEventListener('click', () => taskAction('retry', document.getElementById('retry-mode')?.value));
   document.getElementById('publish-button')?.addEventListener('click', publishProject);
   document.getElementById('refresh-preview')?.addEventListener('click', async () => {
+    const ok = await flushProjectSave(boundProjectId);
+    if (ok) await refreshPreview(true);
+  });
+  document.getElementById('body-mode-edit')?.addEventListener('click', () => {
+    if (state.bodyMode !== 'edit') { state.bodyMode = 'edit'; render(); }
+  });
+  document.getElementById('body-mode-preview')?.addEventListener('click', async () => {
+    if (state.bodyMode === 'preview') return;
+    state.bodyMode = 'preview';
+    render();
+    // 切到预览时自动刷新一次，确保内容最新
     const ok = await flushProjectSave(boundProjectId);
     if (ok) await refreshPreview(true);
   });

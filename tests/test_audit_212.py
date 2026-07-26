@@ -96,7 +96,7 @@ class Audit212Tests(unittest.TestCase):
         _FakeConnection.peer = "93.184.216.34"
         with mock.patch.object(secure_http, "resolve_public", return_value=["93.184.216.34"]), mock.patch.object(
             secure_http, "_PinnedHTTPSConnection", _FakeConnection
-        ):
+        ), mock.patch.object(secure_http, "_has_proxy", return_value=False):
             with self.assertRaises(secure_http.SecureHttpError) as ctx:
                 secure_http.request_bytes(
                     "https://api.example.com/models",
@@ -112,7 +112,7 @@ class Audit212Tests(unittest.TestCase):
         _FakeConnection.peer = "93.184.216.35"
         with mock.patch.object(secure_http, "resolve_public", return_value=["93.184.216.34"]), mock.patch.object(
             secure_http, "_PinnedHTTPSConnection", _FakeConnection
-        ):
+        ), mock.patch.object(secure_http, "_has_proxy", return_value=False):
             with self.assertRaises(secure_http.SecureHttpError) as ctx:
                 secure_http.request_bytes("https://api.example.com/models")
         self.assertEqual(ctx.exception.code, "peer_mismatch")
