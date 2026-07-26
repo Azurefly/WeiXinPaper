@@ -1,0 +1,14 @@
+data/*.db
+data/*.db-*
+data/*.log
+data/*.log.*
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+data/.master.key
+data/.master.key.*
+
+.trae-html-share-packages/
+system-critique/

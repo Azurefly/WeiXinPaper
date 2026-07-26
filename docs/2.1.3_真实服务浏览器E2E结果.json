@@ -1,0 +1,9 @@
+{
+  "product": "公众号 AI Studio",
+  "version": "2.1.3",
+  "generatedAt": "2026-07-23T11:05:19+00:00",
+  "status": "blocked",
+  "reason": "browser_enterprise_policy",
+  "browser": "/usr/bin/chromium",
+  "message": "Page.goto: net::ERR_BLOCKED_BY_ADMINISTRATOR at http://127.0.0.1:38411/#/articles\nCall log:\n  - navigating to \"http://127.0.0.1:38411/#/articles\", waiting until \"domcontentloaded\"\n"
+}

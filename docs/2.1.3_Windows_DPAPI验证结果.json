@@ -1,0 +1,8 @@
+{
+  "product": "公众号 AI Studio",
+  "version": "2.1.3",
+  "generatedAt": "2026-07-23T11:04:27+00:00",
+  "status": "skipped",
+  "reason": "windows_required",
+  "note": "请在 Windows 10/11 普通用户会话中运行 python verify_windows_dpapi.py。"
+}

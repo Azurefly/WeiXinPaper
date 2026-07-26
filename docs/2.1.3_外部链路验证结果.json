@@ -1,0 +1,22 @@
+{
+  "product": "公众号 AI Studio",
+  "version": "2.1.3",
+  "generatedAt": "2026-07-23T11:07:16+00:00",
+  "hostname": "d93542f83c6d",
+  "ai": {
+    "status": "skipped",
+    "reason": "missing_STUDIO_VERIFY_AI_KEY",
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4.1-mini"
+  },
+  "wechat": {
+    "status": "skipped",
+    "reason": "missing_wechat_credentials_and_cover_or_thumb_media_id",
+    "required": [
+      "STUDIO_VERIFY_WECHAT_APPID",
+      "STUDIO_VERIFY_WECHAT_SECRET",
+      "STUDIO_VERIFY_WECHAT_COVER_FILE or STUDIO_VERIFY_WECHAT_THUMB_MEDIA_ID"
+    ]
+  },
+  "note": "结果不记录 API Key、AppSecret 或 access_token；微信成功验证会真实上传封面永久素材（如未提供现有 media_id）并创建一篇草稿。设置 STUDIO_VERIFY_WECHAT_CLEANUP=1 可在验证后请求清理。"
+}
