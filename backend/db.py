@@ -232,6 +232,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             goal TEXT NOT NULL DEFAULT '',
             source_input TEXT NOT NULL DEFAULT '',
+            requirements TEXT NOT NULL DEFAULT '',
             source_kind TEXT NOT NULL DEFAULT 'topic',
             status TEXT NOT NULL DEFAULT 'draft',
             archived INTEGER NOT NULL DEFAULT 0,
@@ -410,6 +411,7 @@ def init_db() -> None:
             project_cols = {
                 "goal": "TEXT NOT NULL DEFAULT ''",
                 "source_input": "TEXT NOT NULL DEFAULT ''",
+                "requirements": "TEXT NOT NULL DEFAULT ''",
                 "source_kind": "TEXT NOT NULL DEFAULT 'topic'",
                 "status": "TEXT NOT NULL DEFAULT 'draft'",
                 "archived": "INTEGER NOT NULL DEFAULT 0",
@@ -560,6 +562,7 @@ def row_to_project(row: sqlite3.Row) -> dict[str, Any]:
         "title": row["title"],
         "goal": _value(row, "goal"),
         "sourceInput": _value(row, "source_input"),
+        "requirements": _value(row, "requirements"),
         "sourceKind": _value(row, "source_kind", "topic"),
         "status": _value(row, "status", "draft"),
         "archived": bool(_value(row, "archived", 0)),

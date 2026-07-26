@@ -202,7 +202,7 @@ class AIEngine:
             raise AIEngineError("ai_json_invalid", "模型 JSON 响应必须是对象")
         return parsed
 
-    def plan(self, goal: str, source_text: str, strict_facts: bool) -> dict[str, Any]:
+    def plan(self, goal: str, source_text: str, strict_facts: bool, requirements: str = "") -> dict[str, Any]:
         if strict_facts:
             policy = (
                 "严格事实模式：只能使用编号来源中可核验的信息；不得补充常识性事实或推测；"
@@ -217,7 +217,17 @@ class AIEngine:
             "你是资深微信公众号内容策划。请基于用户目标和提供材料生成文章框架。"
             f"{policy}返回 JSON，字段为 title、summary、outline；outline 是 4 到 8 个字符串。"
         )
-        user = f"创作目标：\n{goal}\n\n来源内容：\n{source_text[:80_000]}\n\n事实策略：{policy}"
+        requirement_block = (
+            f"文章生成要求：\n{requirements.strip()}\n\n"
+            "请在标题、摘要和框架中严格落实上述要求。"
+            if requirements and requirements.strip()
+            else "文章生成要求：未指定，请根据目标和来源自主发挥。"
+        )
+        user = (
+            f"创作目标：\n{goal}\n\n"
+            f"{requirement_block}\n\n"
+            f"来源内容：\n{source_text[:80_000]}\n\n事实策略：{policy}"
+        )
         data = self._json_object(self._chat(system, user, json_mode=True))
         outline = data.get("outline")
         if not isinstance(outline, list) or not all(isinstance(item, str) and item.strip() for item in outline):
@@ -261,6 +271,7 @@ class AIEngine:
         target_length: int,
         *,
         strict_facts: bool = False,
+        requirements: str = "",
     ) -> str:
         if strict_facts:
             policy = (
@@ -281,9 +292,16 @@ class AIEngine:
             "描述应具体说明该处适合放什么类型的插图（如流程图、示意图、数据图等）。"
             "图片应独占一行，放在相关段落之后。"
         )
+        requirement_block = (
+            f"文章生成要求：\n{requirements.strip()}\n\n"
+            "请在正文风格、篇幅、重点和表达方式上严格落实上述要求。"
+            if requirements and requirements.strip()
+            else "文章生成要求：未指定，请根据目标和来源自主发挥。"
+        )
         user = (
             f"目标字数：约 {target_length} 字\n"
             f"创作目标：{goal}\n"
+            f"{requirement_block}\n"
             f"标题：{plan['title']}\n"
             f"摘要：{plan['summary']}\n"
             f"框架：{json.dumps(plan['outline'], ensure_ascii=False)}\n\n"

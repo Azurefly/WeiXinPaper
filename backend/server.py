@@ -875,7 +875,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             auto_review = body.get("autoReview")
             if auto_review is not None and type(auto_review) is not bool:
                 raise ApiProblem(400, "invalid_auto_review", "autoReview 必须是布尔值")
-            result = create_workflow(str(body.get("sourceInput") or ""), auto_review=auto_review)
+            requirements = str(body.get("requirements") or "")
+            result = create_workflow(str(body.get("sourceInput") or ""), auto_review=auto_review, requirements=requirements)
             self._send_json(202, result)
             return
 

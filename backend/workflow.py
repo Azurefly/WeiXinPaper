@@ -229,12 +229,15 @@ def _conditional_project_update(
     return expected_revision + 1
 
 
-def create_workflow(source_input: str, *, auto_review: bool | None = None, parent_task_id: str = "") -> dict[str, Any]:
+def create_workflow(source_input: str, *, auto_review: bool | None = None, parent_task_id: str = "", requirements: str = "") -> dict[str, Any]:
     value = source_input.strip()
     if not value:
         raise ValueError("请输入来源链接或创作目标")
     if len(value) > 4_000:
         raise ValueError("来源链接或创作目标不能超过 4000 个字符")
+    req_value = (requirements or "").strip()
+    if len(req_value) > 2_000:
+        raise ValueError("文章生成要求不能超过 2000 个字符")
     now = utc_now()
     project_id = _id("prj")
     task_id = _id("tsk")
@@ -246,10 +249,10 @@ def create_workflow(source_input: str, *, auto_review: bool | None = None, paren
         conn.execute(
             """
             INSERT INTO projects(
-                id, title, goal, source_input, source_kind, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'working', ?, ?)
+                id, title, goal, source_input, requirements, source_kind, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'working', ?, ?)
             """,
-            (project_id, provisional_title[:120], value, value, source_kind, now, now),
+            (project_id, provisional_title[:120], value, value, req_value, source_kind, now, now),
         )
         conn.execute(
             """
@@ -421,7 +424,7 @@ def _run_workflow(task_id: str) -> None:
         plan = _load_plan(project)
         if retry_mode in {"full", "preserve_body"}:
             _step(task_id, "outline", 35, "正在生成文章框架")
-            plan = engine.plan(project["goal"], source_text, strict_facts)
+            plan = engine.plan(project["goal"], source_text, strict_facts, requirements=project.get("requirements") or "")
             wlog.info("文章框架生成完成: title=%s", (plan.get("title") or "")[:60])
             _guard(task_id, started)
             expected_revision = _conditional_project_update(
@@ -448,6 +451,7 @@ def _run_workflow(task_id: str) -> None:
                 plan,
                 int(general.get("defaultLength", 1800)),
                 strict_facts=strict_facts,
+                requirements=project.get("requirements") or "",
             )
             wlog.info("正文生成完成: %d 字符", len(body))
             _guard(task_id, started)

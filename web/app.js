@@ -39,6 +39,9 @@ const state = {
   logsAutoRefresh: true,
   logsPollTimer: null,
   bodyMode: 'edit', // 'edit' | 'preview'
+  wsTab: 'write', // 'write' | 'review' | 'publish'
+  wsLeftCollapsed: false,
+  wsRightCollapsed: false,
 };
 
 const ROUTES = {
@@ -233,6 +236,8 @@ function startPolling() {
 
 async function loadRouteData() {
   const { path, params } = routeInfo();
+  const loadingBar = document.getElementById('route-loading');
+  if (loadingBar) loadingBar.classList.add('active');
   try {
     if (path === 'workspace') {
       const projectId = params.get('project');
@@ -252,6 +257,7 @@ async function loadRouteData() {
   } catch (error) {
     toast(error.message, 'error');
   }
+  if (loadingBar) loadingBar.classList.remove('active');
   render();
 }
 
@@ -289,12 +295,18 @@ function renderCreate() {
       <div class="eyebrow">唯一创作入口</div>
       <h2>粘贴来源，或直接说你想写什么</h2>
       <p>输入网页、GitHub 地址或自然语言主题。严格事实模式下，没有可核验来源的主题任务会暂停，不会伪造证据继续生成。</p>
-      <form id="create-form" class="create-box">
-        <div class="field">
-          <label for="source-input">来源或创作目标</label>
-          <input id="source-input" class="input create-input" maxlength="4000" autocomplete="off" placeholder="例如：https://github.com/... 或 写一篇关于 Spring Boot 新版本的公众号文章" required />
+      <form id="create-form">
+        <div class="create-box">
+          <div class="field">
+            <label for="source-input">来源或创作目标</label>
+            <input id="source-input" class="input create-input" maxlength="4000" autocomplete="off" placeholder="例如：https://github.com/... 或 写一篇关于 Spring Boot 新版本的公众号文章" required />
+          </div>
+          <button class="btn btn-primary" type="submit" id="create-button">开始创作 →</button>
         </div>
-        <button class="btn btn-primary" type="submit" id="create-button">开始创作 →</button>
+        <div class="field create-requirements-field">
+          <label for="requirements-input">文章生成要求<span class="helper">（可选，不填则由 AI 自主发挥）</span></label>
+          <textarea id="requirements-input" class="input create-requirements" maxlength="2000" rows="2" placeholder="例如：风格正式、约 800 字、重点突出新特性、面向开发者读者…"></textarea>
+        </div>
       </form>
       <details style="margin-top:16px">
         <summary class="helper">高级设置</summary>
@@ -330,6 +342,30 @@ function timelineHtml(task) {
     const message = wasSkipped ? skipped.get(key) : active || error ? task.message : done ? '已真实执行' : index < currentIndex ? '已处理' : '等待执行';
     return `<div class="timeline-item"><div class="timeline-dot ${cls}">${symbol}</div><div class="timeline-content"><strong>${label}</strong><span>${escapeHtml(message)}</span></div></div>`;
   }).join('')}</div>`;
+}
+
+function miniTimelineHtml(task) {
+  if (!task) return '';
+  const steps = [
+    ['source', '来源'], ['research', '目标'], ['outline', '框架'],
+    ['draft', '正文'], ['cover', '封面'], ['review', '审校'],
+  ];
+  const order = ['queued', 'source', 'research', 'outline', 'draft', 'cover', 'review', 'completed'];
+  const currentIndex = order.indexOf(task.currentStep || 'queued');
+  const events = task.events || [];
+  const skipped = new Set(events.filter((event) => event.detail?.skipped).map((event) => event.step));
+  const executed = new Set(events.filter((event) => !event.detail?.skipped).map((event) => event.step));
+  return `<div class="mini-timeline">${steps.map(([key, label]) => {
+    const index = order.indexOf(key);
+    const wasSkipped = skipped.has(key);
+    const done = !wasSkipped && (executed.has(key) || task.status === 'succeeded' || (index < currentIndex && ['queued', 'running'].includes(task.status)));
+    const active = key === task.currentStep && ['queued', 'running'].includes(task.status);
+    const error = key === task.currentStep && ['failed', 'timeout', 'blocked', 'cancelled'].includes(task.status);
+    const dotCls = wasSkipped ? 'skipped' : done ? 'done' : active ? 'active' : error ? 'error' : 'pending';
+    const symbol = wasSkipped ? '–' : done ? '✓' : active ? '•' : error ? '!' : '';
+    const connCls = done ? 'done' : '';
+    return `<div class="mini-step"><div class="mini-dot ${dotCls}">${symbol}</div><span>${label}</span></div><div class="mini-connector ${connCls}"></div>`;
+  }).join('').replace(/<div class="mini-connector[^"]*"><\/div>$/, '')}</div>`;
 }
 
 function conflictField(label, id, value, textarea = false) {
@@ -382,53 +418,125 @@ function renderWorkspace() {
   const canPublish = reviewCurrent && previewCurrent && project.bodyMarkdown && !blockedBySave;
   const taskActions = task && ['failed', 'blocked', 'timeout', 'cancelled'].includes(task.status)
     ? `<select id="retry-mode" aria-label="重试范围"><option value="review_only">仅重做审校</option><option value="preserve_body">保留正文，重做框架与审校</option><option value="from_outline">从现有框架重做正文</option><option value="full">全部重做</option></select><button class="btn btn-secondary" id="task-retry">按范围重试</button>` : '';
+  const saveLabel = { idle: '已保存', saving: '保存中…', saved: '已保存', error: '保存失败' }[state.saveState] || '已保存';
+  const saveCls = state.saveState === 'saved' ? 'success' : state.saveState === 'error' ? 'danger' : state.saveState === 'saving' ? 'running' : '';
+  const tab = state.wsTab || 'write';
+  const leftCol = state.wsLeftCollapsed ? '' : 'ws-col-open';
+  const rightCol = state.wsRightCollapsed ? '' : 'ws-col-open';
+  const gridCls = `ws-three-col ${state.wsLeftCollapsed ? 'left-collapsed' : ''} ${state.wsRightCollapsed ? 'right-collapsed' : ''}`;
   return `
     <div class="page-head"><div><h2>${escapeHtml(project.title || '未命名文章')}</h2><p>保存完成后生成不可变预览，再终审当前 revision，最后同步该快照。</p></div><div class="top-actions">${statusPill(project.status)} ${statusPill(project.publishStatus)}</div></div>
     ${conflictHtml()}
     ${versionsHtml()}
-    <div class="workspace-layout">
-      <div class="workspace-main">
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>AI 执行</h3><p>${task ? `任务 ${escapeHtml(task.id)}` : '该文章没有关联任务'}</p></div><div class="top-actions">${task ? statusPill(task.status) : ''}${taskActions}</div></div>
-          ${task ? `${timelineHtml(task)}<div class="progress"><i style="width:${Math.max(0, Math.min(100, task.progress || 0))}%"></i></div><div class="top-actions" style="margin-top:14px"><button class="btn btn-ghost" id="open-task">查看任务诊断</button>${['queued', 'running'].includes(task.status) ? '<button class="btn btn-danger" id="task-cancel">取消任务</button>' : ''}${task.status === 'blocked' ? '<button class="btn btn-primary" data-nav="ai">配置 AI</button>' : ''}</div>` : '<div class="empty">没有任务信息</div>'}
-        </section>
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>文章信息</h3><p>同一文章的保存请求严格串行；保存期间继续输入会进入下一批。</p></div><span class="pill ${state.saveState === 'saved' ? 'success' : state.saveState === 'error' ? 'danger' : state.saveState === 'saving' ? 'running' : ''}" id="save-state">${{ idle: '已保存', saving: '保存中…', saved: '已保存', error: '保存失败' }[state.saveState] || '已保存'}</span></div>
-          <div class="field"><label for="project-title">标题</label><input class="input autosave" id="project-title" data-field="title" maxlength="120" value="${escapeHtml(project.title)}"></div>
-          <div class="field" style="margin-top:14px"><label for="project-summary">摘要</label><textarea class="autosave" id="project-summary" data-field="summary" maxlength="300" style="min-height:92px">${escapeHtml(project.summary)}</textarea></div>
-        </section>
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>文章框架</h3><p>重试时可选择复用框架或重新生成。</p></div><button class="btn btn-ghost" id="show-versions">版本历史</button></div>
-          ${project.outline?.length ? `<ol class="outline-list">${project.outline.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ol>` : '<div class="empty"><strong>尚无框架</strong><span>任务完成后会显示文章框架。</span></div>'}
-        </section>
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>正文编辑</h3><p>标题、摘要、正文和封面任一变化都会使终审失效。</p></div><div class="body-mode-switch"><span class="helper" style="margin-right:8px">revision ${project.revision}</span><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'edit' ? 'active' : ''}" id="body-mode-edit">编辑</button><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'preview' ? 'active' : ''}" id="body-mode-preview">预览</button></div></div>
-          ${state.bodyMode === 'edit'
-            ? `<textarea class="editor autosave" id="project-body" data-field="bodyMarkdown" maxlength="500000" placeholder="正文将在这里生成，也可以直接手工写作。">${escapeHtml(project.bodyMarkdown)}</textarea>`
-            : `<div class="body-preview-wrap">${previewCurrent ? `<div class="rich-preview body-preview-content">${state.preview.html}</div>` : '<div class="empty"><strong>暂无预览</strong><span>保存后点击"预览"按钮查看渲染效果。</span></div>'}</div>`
-          }
-        </section>
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>发布前审校</h3><p>只能终审已完成保存且与服务端指纹一致的当前 revision。</p></div></div>
-          ${review.length ? review.map((item) => `<div class="review-item"><div class="review-symbol ${escapeHtml(item.status)}">${item.status === 'passed' ? '✓' : item.status === 'failed' ? '×' : '!'}</div><div><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(item.message)}</p></div></div>`).join('') : '<div class="alert info">自动审校未执行或尚无结果。人工终审仍会绑定当前正文指纹。</div>'}
-          ${blockedBySave ? '<div class="alert warning" style="margin-top:14px">仍有内容未保存或存在冲突，终审和发布已禁用。</div>' : ''}
-          <label class="checkline" style="margin-top:14px"><input type="checkbox" id="review-approved" ${reviewCurrent ? 'checked' : ''} ${blockedBySave || !project.bodyMarkdown ? 'disabled' : ''}><span><strong>我已逐项核对事实、结构、标题、摘要和封面</strong><br><span class="helper">终审记录绑定 revision 与正文 SHA-256；任何编辑都会自动失效。</span></span></label>
-        </section>
+    <div class="ws-shell card">
+      <div class="ws-status-strip">
+        <span class="ws-strip-label">AI 执行</span>
+        ${task ? `<span class="ws-strip-taskid">${escapeHtml(task.id)}</span>${statusPill(task.status)}` : '<span class="helper">该文章没有关联任务</span>'}
+        <span class="ws-strip-sep"></span>
+        <span class="ws-strip-label">保存</span>
+        <span class="pill ${saveCls} save-state-badge">${saveLabel}</span>
+        <div class="ws-strip-actions">${taskActions}<button class="btn btn-ghost ws-strip-btn" id="open-task">诊断</button>${['queued', 'running'].includes(task?.status) ? '<button class="btn btn-danger ws-strip-btn" id="task-cancel">取消</button>' : ''}${task?.status === 'blocked' ? '<button class="btn btn-primary ws-strip-btn" data-nav="ai">配置 AI</button>' : ''}</div>
       </div>
-      <aside class="workspace-side">
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>来源快照</h3><p>按来源身份与内容哈希保存，不覆盖共享快照。</p></div>${project.sourceKind === 'url' ? '<button class="icon-btn" id="refresh-source" aria-label="重新读取来源">↻</button>' : ''}</div>
-          ${sources.length ? sources.map((source) => `<div class="source-card"><strong>${escapeHtml(source.title || source.finalUrl)}</strong><div class="source-meta"><span>${escapeHtml(source.publisher || '未知发布方')}</span><span>${formatTime(source.fetchedAt)}</span></div><div class="source-meta" style="margin-top:8px"><span>SHA-256 ${escapeHtml(source.contentHash.slice(0, 16))}…</span><span>${escapeHtml(source.extractionMethod)}</span></div><p class="source-preview">${escapeHtml(source.preview)}</p></div>`).join('') : `<div class="empty"><strong>${project.sourceKind === 'topic' ? '主题创作' : '尚无来源快照'}</strong><span>${project.sourceKind === 'topic' ? '严格事实模式下，该任务会因缺少证据暂停。' : '来源读取成功后会显示。'}</span></div>`}
-        </section>
-        <section class="card card-pad">
-          <div class="section-title"><div><h3>公众号发布快照</h3><p>这里展示的 HTML 与提交给微信的 HTML 完全一致。</p></div><button class="icon-btn" id="refresh-preview" aria-label="刷新发布预览">↻</button></div>
-          <div class="preview-phone"><div class="preview-bar"></div><div class="preview-content">${project.coverDataUrl ? `<img class="cover-preview" src="${escapeHtml(project.coverDataUrl)}" alt="文章封面">` : ''}<h1>${escapeHtml(project.title)}</h1><div class="digest">${escapeHtml(project.summary || '尚未填写摘要')}</div><div class="preview-body rich-preview" id="publish-preview">${previewCurrent ? state.preview.html : '<p>保存后点击刷新预览。</p>'}</div></div></div>
-          <div class="field" style="margin-top:16px"><label for="cover-file">封面图片（PNG/JPEG/WEBP/GIF，解码后小于 2MB）</label><input class="input" type="file" id="cover-file" accept="image/png,image/jpeg,image/webp,image/gif"></div>
-          ${project.coverDataUrl ? '<button class="btn btn-ghost" id="remove-cover" style="width:100%;margin-top:10px">移除封面</button>' : ''}
-          <button class="btn btn-primary" id="publish-button" style="width:100%;margin-top:14px" ${canPublish ? '' : 'disabled'}>同步当前快照到公众号草稿</button>
-          <p class="helper" style="margin-top:10px">预览 revision：${state.preview?.revision ?? '—'}；终审 revision：${project.reviewRevision || '—'}</p>
-        </section>
-      </aside>
+      ${task ? `<div class="ws-timeline-row">${miniTimelineHtml(task)}</div>` : ''}
+      ${task ? `<div class="ws-progress"><div class="progress"><i style="width:${Math.max(0, Math.min(100, task.progress || 0))}%"></i></div></div>` : ''}
+      <div class="ws-tab-bar">
+        <button class="ws-tab-btn ${tab === 'write' ? 'active' : ''}" data-ws-tab="write">写作</button>
+        <button class="ws-tab-btn ${tab === 'review' ? 'active' : ''}" data-ws-tab="review">审校${review.length ? `<span class="ws-tab-badge">${review.length}</span>` : ''}</button>
+        <button class="ws-tab-btn ${tab === 'publish' ? 'active' : ''}" data-ws-tab="publish">发布</button>
+      </div>
+      <div class="${gridCls}">
+        <!-- LEFT: 文章信息与框架 (collapsible) -->
+        ${!state.wsLeftCollapsed ? `
+        <div class="ws-col-left ${leftCol}">
+          <div class="ws-panel">
+            <div class="ws-panel-head">
+              <h3 class="ws-panel-title">文章信息与框架</h3>
+              <div class="ws-panel-actions"><span class="pill ${saveCls} save-state-badge" id="save-state">${saveLabel}</span><button class="ws-collapse-btn" id="collapse-left" title="收起左栏" aria-label="收起左栏">‹</button></div>
+            </div>
+            <div class="ws-panel-body">
+              <div class="field"><label for="project-title">标题</label><input class="input autosave" id="project-title" data-field="title" maxlength="120" value="${escapeHtml(project.title)}"></div>
+              <div class="field" style="margin-top:12px"><label for="project-summary">摘要</label><textarea class="autosave" id="project-summary" data-field="summary" maxlength="300" style="min-height:72px">${escapeHtml(project.summary)}</textarea></div>
+              <div class="ws-divider"></div>
+              <div class="ws-section-label">文章框架<button class="btn btn-ghost ws-mini-btn" id="show-versions">版本历史</button></div>
+              ${project.outline?.length ? `<ol class="outline-list">${project.outline.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ol>` : '<div class="empty"><strong>尚无框架</strong><span>任务完成后会显示文章框架。</span></div>'}
+              ${project.requirements ? `<div class="ws-divider"></div><div class="ws-section-label">文章生成要求</div><div class="ws-requirements-box">${escapeHtml(project.requirements)}</div>` : ''}
+            </div>
+          </div>
+        </div>` : '<div class="ws-col-collapsed"><button class="ws-expand-tab" id="expand-left" aria-label="展开信息与框架"><span class="ws-expand-icon">›</span>信息与框架</button></div>'}
+
+        <!-- CENTER: 正文编辑 / 审校 / 发布 -->
+        <div class="ws-col-center">
+          ${tab === 'write' ? `
+          <div class="ws-panel">
+            <div class="ws-panel-head">
+              <div><h3 class="ws-panel-title">正文编辑</h3><p class="ws-panel-sub">revision ${project.revision} · 标题、摘要、正文和封面任一变化都会使终审失效</p></div>
+              <div class="body-mode-switch"><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'edit' ? 'active' : ''}" id="body-mode-edit">编辑</button><button class="btn btn-ghost body-mode-btn ${state.bodyMode === 'preview' ? 'active' : ''}" id="body-mode-preview">预览</button></div>
+            </div>
+            <div class="ws-panel-body">
+              ${state.bodyMode === 'edit'
+                ? `<textarea class="editor autosave" id="project-body" data-field="bodyMarkdown" maxlength="500000" placeholder="正文将在这里生成，也可以直接手工写作。">${escapeHtml(project.bodyMarkdown)}</textarea>`
+                : `<div class="body-preview-wrap">${previewCurrent ? `<div class="rich-preview body-preview-content">${state.preview.html}</div>` : '<div class="empty"><strong>暂无预览</strong><span>保存后点击"预览"按钮查看渲染效果。</span></div>'}</div>`
+              }
+            </div>
+          </div>` : ''}
+          ${tab === 'review' ? `
+          <div class="ws-panel">
+            <div class="ws-panel-head">
+              <div><h3 class="ws-panel-title">发布前审校</h3><p class="ws-panel-sub">只能终审已完成保存且与服务端指纹一致的当前 revision</p></div>
+            </div>
+            <div class="ws-panel-body">
+              ${review.length ? review.map((item) => `<div class="review-item"><div class="review-symbol ${escapeHtml(item.status)}">${item.status === 'passed' ? '✓' : item.status === 'failed' ? '×' : '!'}</div><div><strong>${escapeHtml(item.label)}</strong><p>${escapeHtml(item.message)}</p></div></div>`).join('') : '<div class="alert info">自动审校未执行或尚无结果。人工终审仍会绑定当前正文指纹。</div>'}
+              ${blockedBySave ? '<div class="alert warning" style="margin-top:14px">仍有内容未保存或存在冲突，终审和发布已禁用。</div>' : ''}
+              <label class="checkline" style="margin-top:14px"><input type="checkbox" id="review-approved" ${reviewCurrent ? 'checked' : ''} ${blockedBySave || !project.bodyMarkdown ? 'disabled' : ''}><span><strong>我已逐项核对事实、结构、标题、摘要和封面</strong><br><span class="helper">终审记录绑定 revision 与正文 SHA-256；任何编辑都会自动失效。</span></span></label>
+            </div>
+          </div>` : ''}
+          ${tab === 'publish' ? `
+          <div class="ws-panel">
+            <div class="ws-panel-head">
+              <div><h3 class="ws-panel-title">封面图片</h3><p class="ws-panel-sub">PNG/JPEG/WEBP/GIF，解码后小于 2MB</p></div>
+            </div>
+            <div class="ws-panel-body">
+              <div class="field"><label for="cover-file">封面图片</label><input class="input" type="file" id="cover-file" accept="image/png,image/jpeg,image/webp,image/gif"></div>
+              ${project.coverDataUrl ? '<button class="btn btn-ghost" id="remove-cover" style="width:100%;margin-top:10px">移除封面</button>' : ''}
+            </div>
+          </div>
+          <div class="ws-panel" style="margin-top:16px">
+            <div class="ws-panel-head">
+              <div><h3 class="ws-panel-title">发布状态</h3><p class="ws-panel-sub">预览 revision：${state.preview?.revision ?? '—'}；终审 revision：${project.reviewRevision || '—'}</p></div>
+              ${statusPill(project.publishStatus)}
+            </div>
+            <div class="ws-panel-body">
+              ${(() => {
+                const checks = [
+                  { label: '正文已保存', ok: !blockedBySave && Boolean(project.bodyMarkdown) },
+                  { label: '预览已刷新', ok: previewCurrent },
+                  { label: '人工终审通过', ok: reviewCurrent },
+                ];
+                return `<div class="publish-checklist">${checks.map((c) => `<div class="publish-check ${c.ok ? 'ok' : 'pending'}"><span class="publish-check-icon">${c.ok ? '✓' : '○'}</span>${c.label}</div>`).join('')}</div>${canPublish ? '<div class="alert info" style="margin-top:14px">所有条件已满足，可同步到公众号草稿。</div>' : ''}`;
+              })()}
+              <button class="btn btn-primary" id="publish-button" style="width:100%;margin-top:14px" ${canPublish ? '' : 'disabled'}>同步当前快照到公众号草稿</button>
+            </div>
+          </div>` : ''}
+        </div>
+
+        <!-- RIGHT: 侧栏 (collapsible) -->
+        ${!state.wsRightCollapsed ? `
+        <div class="ws-col-right ${rightCol}">
+          <div class="ws-panel">
+            <div class="ws-panel-head">
+              <h3 class="ws-panel-title">侧栏</h3>
+              <div class="ws-panel-actions">${project.sourceKind === 'url' ? '<button class="icon-btn" id="refresh-source" aria-label="重新读取来源">↻</button>' : ''}<button class="ws-collapse-btn" id="collapse-right" title="收起右栏" aria-label="收起右栏">›</button></div>
+            </div>
+            <div class="ws-panel-body">
+              <div class="ws-section-label">来源快照</div>
+              ${sources.length ? sources.map((source) => `<div class="source-card"><strong>${escapeHtml(source.title || source.finalUrl)}</strong><div class="source-meta"><span>${escapeHtml(source.publisher || '未知发布方')}</span><span>${formatTime(source.fetchedAt)}</span></div><div class="source-meta" style="margin-top:8px"><span>SHA-256 ${escapeHtml(source.contentHash.slice(0, 16))}…</span><span>${escapeHtml(source.extractionMethod)}</span></div><p class="source-preview">${escapeHtml(source.preview)}</p></div>`).join('') : `<div class="empty"><strong>${project.sourceKind === 'topic' ? '主题创作' : '尚无来源快照'}</strong><span>${project.sourceKind === 'topic' ? '严格事实模式下，该任务会因缺少证据暂停。' : '来源读取成功后会显示。'}</span></div>`}
+              <div class="ws-divider"></div>
+              <div class="ws-section-label">公众号预览<button class="icon-btn" id="refresh-preview" aria-label="刷新发布预览">↻</button></div>
+              <div class="preview-phone"><div class="preview-bar"></div><div class="preview-content">${project.coverDataUrl ? `<img class="cover-preview" src="${escapeHtml(project.coverDataUrl)}" alt="文章封面">` : ''}<h1>${escapeHtml(project.title)}</h1><div class="digest">${escapeHtml(project.summary || '尚未填写摘要')}</div><div class="preview-body rich-preview" id="publish-preview">${previewCurrent ? state.preview.html : '<p>保存后点击刷新预览。</p>'}</div></div></div>
+            </div>
+          </div>
+        </div>` : '<div class="ws-col-collapsed"><button class="ws-expand-tab" id="expand-right" aria-label="展开侧栏"><span class="ws-expand-icon">‹</span>侧栏</button></div>'}
+      </div>
     </div>`;
 }
 
@@ -779,12 +887,13 @@ function bindCreate() {
     const button = document.getElementById('create-button');
     const sourceInput = input.value.trim();
     if (!sourceInput) return;
+    const requirements = (document.getElementById('requirements-input')?.value || '').trim();
     button.disabled = true;
     button.textContent = '正在创建…';
     try {
       const result = await api('/api/v2/workflows', {
         method: 'POST',
-        body: { sourceInput, autoReview: document.getElementById('create-auto-review').checked },
+        body: { sourceInput, autoReview: document.getElementById('create-auto-review').checked, requirements },
       });
       state.projects.unshift(result.project);
       state.projectCounts.active = Number(state.projectCounts.active || 0) + 1;
@@ -795,7 +904,11 @@ function bindCreate() {
       state.currentTask = result.task;
       await navigate('workspace', { project: result.project.id, task: result.task.id });
     } catch (error) {
-      toast(error.message, 'error');
+      if (error.code === 'network_error') {
+        toast('本地服务不可用，请确认服务已启动后重试。输入内容已保留。', 'error');
+      } else {
+        toast(error.message || '创建失败，请检查输入后重试。输入内容已保留。', 'error');
+      }
       button.disabled = false;
       button.textContent = '开始创作 →';
     }
@@ -821,11 +934,13 @@ function scheduleProjectSave(projectId, field, value) {
 }
 
 function updateSaveBadge() {
-  const badge = document.getElementById('save-state');
-  if (!badge) return;
   const labels = { idle: '已保存', saving: '保存中…', saved: '已保存', error: '保存失败' };
-  badge.textContent = labels[state.saveState] || '已保存';
-  badge.className = `pill ${state.saveState === 'saved' ? 'success' : state.saveState === 'error' ? 'danger' : state.saveState === 'saving' ? 'running' : ''}`;
+  const text = labels[state.saveState] || '已保存';
+  const cls = `pill ${state.saveState === 'saved' ? 'success' : state.saveState === 'error' ? 'danger' : state.saveState === 'saving' ? 'running' : ''}`;
+  document.querySelectorAll('.save-state-badge').forEach((badge) => {
+    badge.textContent = text;
+    badge.className = `${cls} save-state-badge`;
+  });
 }
 
 async function flushProjectSave(projectId) {
@@ -905,6 +1020,24 @@ async function refreshPreview(shouldRender = true) {
 
 function bindWorkspace() {
   const boundProjectId=state.currentProject?.id;
+  document.querySelectorAll('[data-ws-tab]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.wsTab = btn.dataset.wsTab;
+      render();
+    });
+  });
+  document.getElementById('collapse-left')?.addEventListener('click', () => {
+    state.wsLeftCollapsed = true; render();
+  });
+  document.getElementById('expand-left')?.addEventListener('click', () => {
+    state.wsLeftCollapsed = false; render();
+  });
+  document.getElementById('collapse-right')?.addEventListener('click', () => {
+    state.wsRightCollapsed = true; render();
+  });
+  document.getElementById('expand-right')?.addEventListener('click', () => {
+    state.wsRightCollapsed = false; render();
+  });
   document.querySelectorAll('.autosave').forEach((element) => {
     element.addEventListener('input', () => {
       const field = element.dataset.field;
@@ -1208,6 +1341,15 @@ function bindAi() {
   });
   document.getElementById('ai-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
+    const tempInput = document.getElementById('ai-temp');
+    if (tempInput) {
+      const tempVal = Number(tempInput.value);
+      if (Number.isNaN(tempVal) || tempVal < 0 || tempVal > 2) {
+        toast('温度必须在 0 ~ 2 之间', 'error');
+        tempInput.focus();
+        return;
+      }
+    }
     try {
       const draft = syncAiDraftFromDom() || aiFormValue();
       state.settings = await api('/api/v2/settings', { method: 'PATCH', body: { ai: draft } });
@@ -1220,8 +1362,10 @@ function bindAi() {
       toast(error.message, 'error');
     }
   });
-  document.getElementById('verify-ai')?.addEventListener('click', async (event) => {
-    event.currentTarget.disabled = true;
+  document.getElementById('verify-ai')?.addEventListener('click', async () => {
+    const btn = document.getElementById('verify-ai');
+    if (!btn) return;
+    btn.disabled = true;
     try {
       const draft = syncAiDraftFromDom() || aiFormValue();
       const result = await api('/api/v2/settings/ai/verify', { method: 'POST', body: draft });
@@ -1230,7 +1374,8 @@ function bindAi() {
       render();
     } catch (error) {
       toast(error.message, 'error');
-      event.currentTarget.disabled = false;
+      const btn2 = document.getElementById('verify-ai');
+      if (btn2) btn2.disabled = false;
     }
   });
 }
