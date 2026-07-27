@@ -42,6 +42,13 @@ const state = {
   wsTab: 'write', // 'write' | 'review' | 'publish'
   wsLeftCollapsed: false,
   wsRightCollapsed: false,
+  wsPreviewExpanded: false,    // P1: 公众号预览默认折叠
+  wsTimelineExpanded: false,   // P4: 终态Timeline展开
+  expandedSources: new Set(),  // P2: 展开的来源快照ID
+  articleMenuId: null,         // P3: 打开下拉菜单的文章ID
+  aiStatusExpanded: false,     // P5: AI状态详情展开
+  taskEventsExpanded: false,   // P6: 任务事件全部展开
+  wechatConfigExpanded: false, // P7: 微信配置展开
 };
 
 const ROUTES = {
@@ -237,7 +244,7 @@ function startPolling() {
 async function loadRouteData() {
   const { path, params } = routeInfo();
   const loadingBar = document.getElementById('route-loading');
-  if (loadingBar) loadingBar.classList.add('active');
+  if (loadingBar) { loadingBar.classList.remove('done'); loadingBar.classList.add('active'); }
   try {
     if (path === 'workspace') {
       const projectId = params.get('project');
@@ -257,7 +264,10 @@ async function loadRouteData() {
   } catch (error) {
     toast(error.message, 'error');
   }
-  if (loadingBar) loadingBar.classList.remove('active');
+  if (loadingBar) {
+    loadingBar.classList.add('done');
+    setTimeout(() => { loadingBar.classList.remove('active', 'done'); }, 500);
+  }
   render();
 }
 
@@ -313,11 +323,14 @@ function renderCreate() {
         <label class="checkline" style="margin-top:12px"><input type="checkbox" id="create-auto-review" ${state.settings.ai?.autoReview !== false ? 'checked' : ''}><span><strong>生成后自动审校</strong><br><span class="helper">关闭后时间线会明确显示“已跳过”，不会伪装成已执行。</span></span></label>
       </details>
     </section>
-    <div class="grid grid-3 stats">
-      <div class="card stat"><strong>${state.projectCounts.active ?? state.projects.filter((p) => !p.archived && !p.deleted).length}</strong><span>当前文章</span></div>
-      <div class="card stat"><strong>${activeCount}</strong><span>正在执行</span></div>
-      <div class="card stat"><strong>${finishedCount}</strong><span>成功任务</span></div>
-    </div>`;
+    <details class="create-stats-collapse" style="margin-top:16px">
+      <summary class="helper">工作台概览</summary>
+      <div class="grid grid-3 stats" style="margin-top:12px">
+        <div class="card stat"><strong>${state.projectCounts.active ?? state.projects.filter((p) => !p.archived && !p.deleted).length}</strong><span>当前文章</span></div>
+        <div class="card stat"><strong>${activeCount}</strong><span>正在执行</span></div>
+        <div class="card stat"><strong>${finishedCount}</strong><span>成功任务</span></div>
+      </div>
+    </details>`;
 }
 
 function timelineHtml(task) {
@@ -375,20 +388,26 @@ function conflictField(label, id, value, textarea = false) {
   return `<div class="field"><label for="${id}">${label}</label>${tag}</div>`;
 }
 
+const FIELD_LABELS = { title: '标题', summary: '摘要', bodyMarkdown: '正文', coverDataUrl: '封面' };
+
 function conflictHtml() {
   if (!state.conflict) return '';
   const { server, pendingFields } = state.conflict;
+  const pendingLabels = Object.keys(pendingFields).map((k) => FIELD_LABELS[k] || k).join('、') || '正文';
+  const hasCover = (pendingFields.coverDataUrl !== undefined ? pendingFields.coverDataUrl : server.coverDataUrl) || '';
   return `<section class="card card-pad conflict">
     <div class="section-title"><div><h3>检测到多字段编辑冲突</h3><p>标题、摘要、正文和封面都保留在本地，不会被静默丢弃。</p></div>${statusPill('warning')}</div>
     <div class="grid grid-2">
       <div class="source-card"><strong>服务端 revision ${server.revision}</strong><p class="helper">${escapeHtml(server.title)}</p><p class="helper">${escapeHtml(server.summary)}</p></div>
-      <div class="source-card"><strong>本地待保存字段</strong><p class="helper">${escapeHtml(Object.keys(pendingFields).join('、') || '正文')}</p></div>
+      <div class="source-card"><strong>本地待保存字段</strong><p class="helper">${escapeHtml(pendingLabels)}</p></div>
     </div>
     <div class="form-grid" style="margin-top:14px">
       ${conflictField('本地标题', 'conflict-title', pendingFields.title ?? server.title)}
       ${conflictField('本地摘要', 'conflict-summary', pendingFields.summary ?? server.summary, true)}
       <div class="wide">${conflictField('本地正文', 'conflict-body', pendingFields.bodyMarkdown ?? server.bodyMarkdown, true)}</div>
     </div>
+    ${hasCover ? `<div class="form-grid" style="margin-top:14px"><div class="wide"><label class="field"><span class="helper">本地封面（已保留，将随覆盖/合并写入）</span></label><img class="cover-preview" src="${escapeHtml(hasCover)}" alt="本地封面" style="max-width:200px;border-radius:10px"></div></div>` : ''}
+    <div class="alert warning" style="margin-top:14px">合并仅简单拼接服务端和本地正文，需手动整理格式；封面在合并时保留本地版本。</div>
     <div class="top-actions" style="margin-top:14px">
       <button class="btn btn-ghost" id="conflict-use-server">采用服务端</button>
       <button class="btn btn-secondary" id="conflict-merge">合并正文并保留本地信息</button>
@@ -435,10 +454,13 @@ function renderWorkspace() {
         <span class="ws-strip-sep"></span>
         <span class="ws-strip-label">保存</span>
         <span class="pill ${saveCls} save-state-badge">${saveLabel}</span>
+        <span class="ws-strip-sep"></span>
+        <span class="ws-strip-label">来源</span>
+        <span class="pill">${project.sourceKind === 'url' ? 'URL' : '主题'}</span>
         <div class="ws-strip-actions">${taskActions}<button class="btn btn-ghost ws-strip-btn" id="open-task">诊断</button>${['queued', 'running'].includes(task?.status) ? '<button class="btn btn-danger ws-strip-btn" id="task-cancel">取消</button>' : ''}${task?.status === 'blocked' ? '<button class="btn btn-primary ws-strip-btn" data-nav="ai">配置 AI</button>' : ''}</div>
       </div>
-      ${task ? `<div class="ws-timeline-row">${miniTimelineHtml(task)}</div>` : ''}
-      ${task ? `<div class="ws-progress"><div class="progress"><i style="width:${Math.max(0, Math.min(100, task.progress || 0))}%"></i></div></div>` : ''}
+      ${task && ['queued', 'running'].includes(task.status) ? `<div class="ws-timeline-row">${miniTimelineHtml(task)}</div><div class="ws-progress"><div class="progress"><i style="width:${Math.max(0, Math.min(100, task.progress || 0))}%"></i></div></div>` : ''}
+      ${task && !['queued', 'running'].includes(task.status) ? (state.wsTimelineExpanded ? `<div class="ws-timeline-row">${miniTimelineHtml(task)}<button class="btn btn-ghost ws-mini-btn" id="toggle-timeline" style="margin-left:12px">收起</button></div>` : `<div class="ws-timeline-collapsed"><span class="helper">执行轨迹：${escapeHtml(task.currentStep || task.status)}</span><button class="btn btn-ghost ws-mini-btn" id="toggle-timeline">展开轨迹</button></div>`) : ''}
       <div class="ws-tab-bar">
         <button class="ws-tab-btn ${tab === 'write' ? 'active' : ''}" data-ws-tab="write">写作</button>
         <button class="ws-tab-btn ${tab === 'review' ? 'active' : ''}" data-ws-tab="review">审校${review.length ? `<span class="ws-tab-badge">${review.length}</span>` : ''}</button>
@@ -529,10 +551,21 @@ function renderWorkspace() {
             </div>
             <div class="ws-panel-body">
               <div class="ws-section-label">来源快照</div>
-              ${sources.length ? sources.map((source) => `<div class="source-card"><strong>${escapeHtml(source.title || source.finalUrl)}</strong><div class="source-meta"><span>${escapeHtml(source.publisher || '未知发布方')}</span><span>${formatTime(source.fetchedAt)}</span></div><div class="source-meta" style="margin-top:8px"><span>SHA-256 ${escapeHtml(source.contentHash.slice(0, 16))}…</span><span>${escapeHtml(source.extractionMethod)}</span></div><p class="source-preview">${escapeHtml(source.preview)}</p></div>`).join('') : `<div class="empty"><strong>${project.sourceKind === 'topic' ? '主题创作' : '尚无来源快照'}</strong><span>${project.sourceKind === 'topic' ? '严格事实模式下，该任务会因缺少证据暂停。' : '来源读取成功后会显示。'}</span></div>`}
+              ${sources.length ? sources.map((source) => {
+                const sid = source.id || source.contentHash?.slice(0, 12) || '';
+                const expanded = state.expandedSources.has(sid);
+                return `<div class="source-card">
+                  <strong>${escapeHtml(source.title || source.finalUrl)}</strong>
+                  <div class="source-meta"><span>${escapeHtml(source.publisher || '未知发布方')}</span><span>${formatTime(source.fetchedAt)}</span></div>
+                  ${expanded ? `<div class="source-meta" style="margin-top:8px"><span>SHA-256 ${escapeHtml(source.contentHash.slice(0, 16))}…</span><span>${escapeHtml(source.extractionMethod)}</span></div><p class="source-preview">${escapeHtml(source.preview)}</p><button class="btn btn-ghost ws-mini-btn source-toggle-btn" data-source-toggle="${escapeHtml(sid)}">收起详情</button>` : `<button class="btn btn-ghost ws-mini-btn source-toggle-btn" data-source-toggle="${escapeHtml(sid)}">查看详情</button>`}
+                </div>`;
+              }).join('') : `<div class="empty"><strong>${project.sourceKind === 'topic' ? '主题创作' : '尚无来源快照'}</strong><span>${project.sourceKind === 'topic' ? '严格事实模式下，该任务会因缺少证据暂停。' : '来源读取成功后会显示。'}</span></div>`}
               <div class="ws-divider"></div>
               <div class="ws-section-label">公众号预览<button class="icon-btn" id="refresh-preview" aria-label="刷新发布预览">↻</button></div>
-              <div class="preview-phone"><div class="preview-bar"></div><div class="preview-content">${project.coverDataUrl ? `<img class="cover-preview" src="${escapeHtml(project.coverDataUrl)}" alt="文章封面">` : ''}<h1>${escapeHtml(project.title)}</h1><div class="digest">${escapeHtml(project.summary || '尚未填写摘要')}</div><div class="preview-body rich-preview" id="publish-preview">${previewCurrent ? state.preview.html : '<p>保存后点击刷新预览。</p>'}</div></div></div>
+              ${state.wsPreviewExpanded
+                ? `<div class="preview-phone"><div class="preview-bar"></div><div class="preview-content">${project.coverDataUrl ? `<img class="cover-preview" src="${escapeHtml(project.coverDataUrl)}" alt="文章封面">` : ''}<h1>${escapeHtml(project.title)}</h1><div class="digest">${escapeHtml(project.summary || '尚未填写摘要')}</div><div class="preview-body rich-preview" id="publish-preview">${previewCurrent ? state.preview.html : '<p>保存后点击刷新预览。</p>'}</div></div></div><button class="btn btn-ghost ws-mini-btn" id="toggle-preview" style="width:100%;margin-top:10px">收起预览</button>`
+                : `<button class="btn btn-secondary" id="toggle-preview" style="width:100%">查看公众号预览</button>`
+              }
             </div>
           </div>
         </div>` : '<div class="ws-col-collapsed"><button class="ws-expand-tab" id="expand-right" aria-label="展开侧栏"><span class="ws-expand-icon">‹</span>侧栏</button></div>'}
@@ -549,7 +582,7 @@ function renderArticles() {
       <div class="searchbar"><input class="input" id="article-search" placeholder="搜索标题或摘要" value="${escapeHtml(state.search)}"><label class="checkline"><input type="checkbox" id="show-archived" ${state.showArchived ? 'checked' : ''} ${state.showDeleted ? 'disabled' : ''}><span>显示归档</span></label><label class="checkline"><input type="checkbox" id="show-deleted" ${state.showDeleted ? 'checked' : ''}><span>回收站</span></label></div>
       <div class="article-list">${state.projects.length ? state.projects.map((project) => `
         <article class="card article-row"><div><h3>${escapeHtml(project.title)}</h3><p>${escapeHtml(project.summary || '暂无摘要')} · revision ${project.revision} · ${formatTime(project.updatedAt)}</p></div><div class="article-actions">
-          ${project.deleted ? `<button class="btn btn-secondary" data-restore-deleted="${project.id}">恢复</button><button class="btn btn-danger" data-purge-project="${project.id}">永久删除</button>` : `<button class="btn btn-primary" data-open-project="${project.id}">打开</button><button class="btn btn-ghost" data-export-project="${project.id}">导出</button><button class="btn btn-ghost" data-copy-project="${project.id}">复制</button><button class="btn btn-ghost" data-archive-project="${project.id}" data-archived="${project.archived}">${project.archived ? '取消归档' : '归档'}</button><button class="btn btn-danger" data-delete-project="${project.id}">删除</button>`}
+          ${project.deleted ? `<button class="btn btn-secondary" data-restore-deleted="${project.id}">恢复</button><button class="btn btn-danger" data-purge-project="${project.id}">永久删除</button>` : `<button class="btn btn-primary" data-open-project="${project.id}">打开</button><div class="article-menu-wrap"><button class="icon-btn article-menu-btn" data-article-menu="${project.id}" aria-label="更多操作">⋯</button>${state.articleMenuId === project.id ? `<div class="article-menu"><button class="article-menu-item" data-export-project="${project.id}">导出</button><button class="article-menu-item" data-copy-project="${project.id}">复制</button><button class="article-menu-item" data-archive-project="${project.id}" data-archived="${project.archived}">${project.archived ? '取消归档' : '归档'}</button><button class="article-menu-item article-menu-danger" data-delete-project="${project.id}">删除</button></div>` : ''}</div>`}
         </div></article>`).join('') : `<div class="empty"><strong>${state.showDeleted ? '回收站为空' : state.search ? '没有匹配文章' : '暂无文章'}</strong><span>${state.showDeleted ? '删除的文章会显示在这里。' : state.search ? '请调整搜索词。' : '从唯一创作入口开始。'}</span></div>`}</div>
       <div class="pagination" aria-label="文章分页">
         <button class="btn btn-ghost" id="article-prev" ${state.articlePage <= 0 ? 'disabled' : ''}>上一页</button>
@@ -568,24 +601,29 @@ function renderAi() {
     apiKey: '',
     model: savedAi.model || '',
     temperature: savedAi.temperature ?? 0.4,
+    maxTokens: savedAi.maxTokens ?? 4096,
     autoReview: savedAi.autoReview !== false,
   };
   const health = state.health?.ai || {};
+  const statusSummary = `${health.configured ? '✓ 已配置' : '✗ 未配置'} · ${health.reachable ? '✓ 可连接' : '✗ 不可连接'} · 最近验证 ${formatTime(health.verifiedAt)}`;
   return `
     <div class="page-head"><div><h2>AI 能力</h2><p>配置、可连接、最近验证成功是三个独立状态。</p></div></div>
-    <div class="grid grid-2">
+    <div class="ai-status-bar">
+      <span class="helper">${escapeHtml(statusSummary)}</span>
+      <button class="btn btn-ghost ws-mini-btn" id="toggle-ai-status">${state.aiStatusExpanded ? '收起详情' : '查看详情'}</button>
+    </div>
+    ${state.aiStatusExpanded ? `<section class="card card-pad" style="margin-bottom:18px"><div class="stack"><div class="source-card"><strong>已配置</strong><p class="helper">${health.configured ? '是' : '否'}</p></div><div class="source-card"><strong>可连接</strong><p class="helper">${health.reachable ? '是' : '否'}</p></div><div class="source-card"><strong>最近验证</strong><p class="helper">${formatTime(health.verifiedAt)} · ${escapeHtml(health.message || '尚未验证')}</p></div></div></section>` : ''}
+    <div>
       <section class="card card-pad"><div class="section-title"><div><h3>OpenAI 兼容模型</h3><p>请求固定到已验证公网 IP，禁止重定向携带 Authorization。</p></div></div>
         <form id="ai-form" class="setting-group">
           <div class="field"><label for="ai-base-url">Base URL</label><input class="input" id="ai-base-url" value="${escapeHtml(ai.baseUrl || 'https://api.openai.com/v1')}"></div>
           <div class="field"><label for="ai-key">API Key ${apiKeyHint ? `（已保存 ${escapeHtml(apiKeyHint)}）` : ''}</label><input class="input" type="password" id="ai-key" value="${escapeHtml(ai.apiKey || '')}" placeholder="留空表示保持原值"></div>
           <div class="field"><label for="ai-model">模型</label><input class="input" id="ai-model" value="${escapeHtml(ai.model || '')}"></div>
           <div class="field"><label for="ai-temp">温度</label><input class="input" id="ai-temp" type="number" min="0" max="2" step="0.1" value="${escapeHtml(ai.temperature ?? 0.4)}"></div>
+          <div class="field"><label for="ai-max-tokens">最大 Tokens</label><input class="input" id="ai-max-tokens" type="number" min="1024" max="16384" step="256" value="${escapeHtml(ai.maxTokens ?? 4096)}"><span class="helper">控制单次 AI 回复的最大长度（1024–16384）</span></div>
           <label class="checkline"><input type="checkbox" id="ai-auto-review" ${ai.autoReview !== false ? 'checked' : ''}><span><strong>自动审校</strong><br><span class="helper">关闭后服务端会记录明确 skipped 事件。</span></span></label>
           <div class="top-actions"><button class="btn btn-primary" type="submit">保存设置</button><button class="btn btn-secondary" type="button" id="verify-ai">验证真实连接</button></div>
         </form>
-      </section>
-      <section class="card card-pad"><div class="section-title"><div><h3>状态</h3><p>最近验证结果不会被“已保存密钥”替代。</p></div></div>
-        <div class="stack"><div class="source-card"><strong>已配置</strong><p class="helper">${health.configured ? '是' : '否'}</p></div><div class="source-card"><strong>可连接</strong><p class="helper">${health.reachable ? '是' : '否'}</p></div><div class="source-card"><strong>最近验证</strong><p class="helper">${formatTime(health.verifiedAt)} · ${escapeHtml(health.message || '尚未验证')}</p></div></div>
       </section>
     </div>`;
 }
@@ -617,14 +655,14 @@ function renderSettings() {
           <button class="btn btn-primary" type="submit">保存通用设置</button>
         </form>
       </section>
-      <section class="card card-pad"><div class="section-title"><div><h3>微信公众号</h3><p>先用临时凭证验证成功，再原子替换已保存配置。</p></div>${statusPill(health.reachable ? 'succeeded' : 'blocked')}</div>
-        <form id="wechat-form" class="setting-group">
+      <section class="card"><div class="section-title wechat-header" id="toggle-wechat"><div><h3>微信公众号</h3><p>${escapeHtml(wechat.accountName || '未配置')} · ${escapeHtml(health.message || (health.reachable ? '已验证' : '未验证'))}</p></div>${statusPill(health.reachable ? 'succeeded' : 'blocked')}<button class="ws-collapse-btn" aria-label="展开配置">${state.wechatConfigExpanded ? '‹' : '›'}</button></div>
+        ${state.wechatConfigExpanded ? `<div class="card-pad"><form id="wechat-form" class="setting-group">
           <div class="field"><label for="wechat-name">公众号名称</label><input class="input" id="wechat-name" maxlength="120" value="${escapeHtml(wechat.accountName || '')}"></div>
           <div class="field"><label for="wechat-appid">AppID</label><input class="input" id="wechat-appid" maxlength="128" value="${escapeHtml(wechat.appId || '')}"></div>
           <div class="field"><label for="wechat-secret">AppSecret ${appSecretHint ? `（已保存 ${escapeHtml(appSecretHint)}）` : ''}</label><input class="input" type="password" id="wechat-secret" value="${escapeHtml(wechat.appSecret || '')}" placeholder="留空保持原值"></div>
           <div class="field"><label for="wechat-thumb">默认封面 Media ID（未上传本地封面时使用）</label><input class="input" id="wechat-thumb" maxlength="256" value="${escapeHtml(wechat.thumbMediaId || '')}"></div>
           <button class="btn btn-primary" type="submit">验证并保存</button>
-        </form>
+        </form></div>` : ''}
       </section>
     </div>`;
 }
@@ -838,7 +876,15 @@ function renderTasks() {
     <div class="page-head"><div><h2>任务诊断</h2><p>任务显示文章标题、状态、重试范围与真实事件；跳过步骤不会标记为完成。</p></div></div>
     <div class="grid grid-2">
       <section class="card card-pad"><div class="article-list">${state.tasks.length ? state.tasks.map((task) => `<button class="source-card task-select" data-open-task="${task.id}"><strong>${escapeHtml(task.projectTitle || task.projectId)}</strong><div class="source-meta"><span>${escapeHtml(task.status)}</span><span>${formatTime(task.updatedAt)}</span><span>${task.progress}%</span></div><p class="helper">${escapeHtml(task.message)}</p></button>`).join('') : '<div class="empty">暂无任务</div>'}</div></section>
-      <section class="card card-pad">${selected ? `<div class="stack"><div class="section-title"><div><h3>${escapeHtml(selected.projectTitle || '任务详情')}</h3><p>${escapeHtml(selected.id)}</p></div>${statusPill(selected.status)}</div>${selected.errorCode ? `<div class="alert error"><strong>${escapeHtml(selected.errorCode)}</strong><br>${escapeHtml(selected.errorDetail || selected.message)}</div>` : ''}${timelineHtml(selected)}<div>${(selected.events || []).map((event) => `<div class="task-event ${escapeHtml(event.level)}"><strong>${formatTime(event.createdAt)} · ${escapeHtml(event.step)}${event.detail?.skipped ? ' · 已跳过' : ''}</strong><p>${escapeHtml(event.message)}</p></div>`).join('')}</div><div class="top-actions">${['queued', 'running'].includes(selected.status) ? '<button class="btn btn-danger" id="diag-cancel">取消</button>' : ''}${['failed', 'blocked', 'timeout', 'cancelled'].includes(selected.status) ? '<select id="diag-retry-mode"><option value="review_only">仅审校</option><option value="preserve_body">保留正文</option><option value="from_outline">从框架重做</option><option value="full">全部重做</option></select><button class="btn btn-secondary" id="diag-retry">重试</button>' : ''}${selected.projectId ? '<button class="btn btn-primary" id="diag-open-project">打开文章</button>' : ''}</div></div>` : '<div class="empty">从左侧选择任务查看详情</div>'}</section>
+      <section class="card card-pad">${selected ? (() => {
+        const allEvents = selected.events || [];
+        const errorEvents = allEvents.filter((e) => e.level === 'error');
+        const recentEvents = allEvents.slice(-5);
+        const visibleEvents = state.taskEventsExpanded ? allEvents : [...new Set([...errorEvents, ...recentEvents])];
+        const eventList = visibleEvents.map((event) => `<div class="task-event ${escapeHtml(event.level)}"><strong>${formatTime(event.createdAt)} · ${escapeHtml(event.step)}${event.detail?.skipped ? ' · 已跳过' : ''}</strong><p>${escapeHtml(event.message)}</p></div>`).join('');
+        const eventToggle = allEvents.length > 5 ? `<button class="btn btn-ghost ws-mini-btn" id="toggle-task-events" style="margin-top:10px">${state.taskEventsExpanded ? '只显示最近 5 条' : `显示全部 ${allEvents.length} 条事件`}</button>` : '';
+        return `<div class="stack"><div class="section-title"><div><h3>${escapeHtml(selected.projectTitle || '任务详情')}</h3><p>${escapeHtml(selected.id)}</p></div>${statusPill(selected.status)}</div>${selected.errorCode ? `<div class="alert error"><strong>${escapeHtml(selected.errorCode)}</strong><br>${escapeHtml(selected.errorDetail || selected.message)}</div>` : ''}${timelineHtml(selected)}<div>${eventList}${eventToggle}</div><div class="top-actions">${['queued', 'running'].includes(selected.status) ? '<button class="btn btn-danger" id="diag-cancel">取消</button>' : ''}${['failed', 'blocked', 'timeout', 'cancelled'].includes(selected.status) ? '<select id="diag-retry-mode"><option value="review_only">仅审校</option><option value="preserve_body">保留正文</option><option value="from_outline">从框架重做</option><option value="full">全部重做</option></select><button class="btn btn-secondary" id="diag-retry">重试</button>' : ''}${selected.projectId ? '<button class="btn btn-primary" id="diag-open-project">打开文章</button>' : ''}</div></div>`;
+      })() : '<div class="empty">从左侧选择任务查看详情</div>'}</section>
     </div>`;
 }
 
@@ -886,7 +932,11 @@ function bindCreate() {
     const input = document.getElementById('source-input');
     const button = document.getElementById('create-button');
     const sourceInput = input.value.trim();
-    if (!sourceInput) return;
+    if (!sourceInput) {
+      toast('请输入来源链接或创作目标', 'error');
+      input.focus();
+      return;
+    }
     const requirements = (document.getElementById('requirements-input')?.value || '').trim();
     button.disabled = true;
     button.textContent = '正在创建…';
@@ -1038,6 +1088,20 @@ function bindWorkspace() {
   document.getElementById('expand-right')?.addEventListener('click', () => {
     state.wsRightCollapsed = false; render();
   });
+  document.getElementById('toggle-preview')?.addEventListener('click', () => {
+    state.wsPreviewExpanded = !state.wsPreviewExpanded; render();
+  });
+  document.getElementById('toggle-timeline')?.addEventListener('click', () => {
+    state.wsTimelineExpanded = !state.wsTimelineExpanded; render();
+  });
+  document.querySelectorAll('[data-source-toggle]')?.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const sid = btn.dataset.sourceToggle;
+      if (state.expandedSources.has(sid)) state.expandedSources.delete(sid);
+      else state.expandedSources.add(sid);
+      render();
+    });
+  });
   document.querySelectorAll('.autosave').forEach((element) => {
     element.addEventListener('input', () => {
       const field = element.dataset.field;
@@ -1069,8 +1133,10 @@ function bindWorkspace() {
       event.target.disabled = false;
     }
   });
-  document.getElementById('refresh-source')?.addEventListener('click', async (event) => {
-    event.currentTarget.disabled = true;
+  document.getElementById('refresh-source')?.addEventListener('click', async () => {
+    const btn = document.getElementById('refresh-source');
+    if (!btn) return;
+    btn.disabled = true;
     try {
       const ok = await flushProjectSave(boundProjectId);
       if (!ok) throw new Error('请先处理编辑冲突');
@@ -1084,7 +1150,8 @@ function bindWorkspace() {
       render();
     } catch (error) {
       toast(error.message, 'error');
-      event.currentTarget.disabled = false;
+      const btn2 = document.getElementById('refresh-source');
+      if (btn2) btn2.disabled = false;
     }
   });
   document.getElementById('open-task')?.addEventListener('click', () => navigate('tasks', { task: state.currentTask.id }));
@@ -1313,6 +1380,15 @@ function bindArticles() {
     if (!confirm('永久删除后无法恢复，确认继续？')) return;
     try { await api(`/api/v2/projects/${button.dataset.purgeProject}/purge`, { method: 'DELETE', body: {} }); await reloadProjects(); toast('文章已永久删除', 'success'); render(); } catch (error) { toast(error.message, 'error'); }
   }));
+  document.querySelectorAll('[data-article-menu]').forEach((button) => button.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const id = button.dataset.articleMenu;
+    state.articleMenuId = state.articleMenuId === id ? null : id;
+    render();
+  }));
+  document.addEventListener('click', () => {
+    if (state.articleMenuId) { state.articleMenuId = null; render(); }
+  }, { once: true });
 }
 
 function aiFormValue() {
@@ -1322,6 +1398,7 @@ function aiFormValue() {
     apiKey: document.getElementById('ai-key').value.trim(),
     model: document.getElementById('ai-model').value.trim(),
     temperature: Number(document.getElementById('ai-temp').value),
+    maxTokens: Number(document.getElementById('ai-max-tokens').value),
     autoReview: document.getElementById('ai-auto-review').checked,
   };
 }
@@ -1334,22 +1411,30 @@ function syncAiDraftFromDom() {
   return state.aiDraft;
 }
 
+function validateAiTemperature() {
+  const tempInput = document.getElementById('ai-temp');
+  if (tempInput) {
+    const tempVal = Number(tempInput.value);
+    if (Number.isNaN(tempVal) || tempVal < 0 || tempVal > 2) {
+      toast('温度必须在 0 ~ 2 之间', 'error');
+      tempInput.focus();
+      return false;
+    }
+  }
+  return true;
+}
+
 function bindAi() {
+  document.getElementById('toggle-ai-status')?.addEventListener('click', () => {
+    state.aiStatusExpanded = !state.aiStatusExpanded; render();
+  });
   document.querySelectorAll('#ai-form input').forEach((element) => {
     const eventName = element.type === 'checkbox' ? 'change' : 'input';
     element.addEventListener(eventName, syncAiDraftFromDom);
   });
   document.getElementById('ai-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const tempInput = document.getElementById('ai-temp');
-    if (tempInput) {
-      const tempVal = Number(tempInput.value);
-      if (Number.isNaN(tempVal) || tempVal < 0 || tempVal > 2) {
-        toast('温度必须在 0 ~ 2 之间', 'error');
-        tempInput.focus();
-        return;
-      }
-    }
+    if (!validateAiTemperature()) return;
     try {
       const draft = syncAiDraftFromDom() || aiFormValue();
       state.settings = await api('/api/v2/settings', { method: 'PATCH', body: { ai: draft } });
@@ -1365,6 +1450,7 @@ function bindAi() {
   document.getElementById('verify-ai')?.addEventListener('click', async () => {
     const btn = document.getElementById('verify-ai');
     if (!btn) return;
+    if (!validateAiTemperature()) return;
     btn.disabled = true;
     try {
       const draft = syncAiDraftFromDom() || aiFormValue();
@@ -1414,6 +1500,9 @@ function syncWechatDraftFromDom() {
 }
 
 function bindSettings() {
+  document.getElementById('toggle-wechat')?.addEventListener('click', () => {
+    state.wechatConfigExpanded = !state.wechatConfigExpanded; render();
+  });
   document.querySelectorAll('#general-form input').forEach((element) => {
     const eventName = element.type === 'checkbox' ? 'change' : 'input';
     element.addEventListener(eventName, syncGeneralDraftFromDom);
@@ -1469,6 +1558,7 @@ function bindTasks() {
   document.getElementById('diag-cancel')?.addEventListener('click', () => taskAction('cancel'));
   document.getElementById('diag-retry')?.addEventListener('click', () => taskAction('retry', document.getElementById('diag-retry-mode')?.value));
   document.getElementById('diag-open-project')?.addEventListener('click', () => navigate('workspace', { project: state.currentTask.projectId, task: state.currentTask.id }));
+  document.getElementById('toggle-task-events')?.addEventListener('click', () => { state.taskEventsExpanded = !state.taskEventsExpanded; render(); });
 }
 
 window.addEventListener('hashchange', async () => { state.mobileOpen = false; await loadRouteData(); });

@@ -144,7 +144,7 @@ def _validate_general_settings(incoming: dict[str, Any], existing: dict[str, Any
 
 
 def _validate_ai_settings(incoming: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"providerId", "baseUrl", "apiKey", "model", "temperature", "autoReview"}
+    allowed = {"providerId", "baseUrl", "apiKey", "model", "temperature", "autoReview", "maxTokens"}
     unknown = set(incoming) - allowed
     if unknown:
         raise ApiProblem(400, "invalid_settings", f"不支持的 AI 设置：{', '.join(sorted(unknown))}")
@@ -156,6 +156,8 @@ def _validate_ai_settings(incoming: dict[str, Any], existing: dict[str, Any]) ->
         merged["temperature"] = _require_number(incoming["temperature"], "温度", 0, 2)
     if "autoReview" in incoming:
         merged["autoReview"] = _require_bool(incoming["autoReview"], "自动审校")
+    if "maxTokens" in incoming:
+        merged["maxTokens"] = int(_require_number(incoming["maxTokens"], "最大 tokens", 1024, 16384))
     if "apiKey" in incoming and not isinstance(incoming["apiKey"], str):
         raise ApiProblem(400, "invalid_settings", "API Key 必须是字符串")
     if len(str(merged.get("apiKey") or "")) > 1_024:
