@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 import desktop
-from build_scripts import build_desktop
+from build_scripts import build_desktop, gen_icon
 
 
 class DesktopReleaseTests(unittest.TestCase):
@@ -72,6 +74,45 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertIn('"--deep", "--strict"', source)
         self.assertIn('reconfigure(errors="replace")', source)
         self.assertNotIn("签名验证有警告（不影响运行", source)
+        spec = (
+            Path(__file__).resolve().parents[1]
+            / "build_scripts"
+            / "desktop.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PROJECT_ROOT = Path(SPEC).resolve().parent.parent", spec)
+        self.assertIn("icon=icon_path", spec)
+        self.assertNotIn("icon_path if Path(icon_path).exists() else None", spec)
+
+    def test_custom_icon_source_has_safe_transparent_edges_and_multisize_ico(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "build_assets"
+            / "AppIconSource.png"
+        )
+        master = gen_icon.render_icon(1024, source_path)
+        self.assertEqual(master.mode, "RGBA")
+        self.assertEqual(master.size, (1024, 1024))
+        alpha = master.getchannel("A")
+        self.assertEqual(alpha.getpixel((0, 0)), 0)
+        self.assertEqual(alpha.getpixel((1023, 1023)), 0)
+        bbox = alpha.getbbox()
+        self.assertIsNotNone(bbox)
+        self.assertGreaterEqual(min(bbox[0], bbox[1]), 55)
+        self.assertLessEqual(max(bbox[2], bbox[3]), 969)
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            icns_path = gen_icon.build_macos_icon(temp_path, master)
+            with Image.open(icns_path) as icon:
+                self.assertEqual(icon.format, "ICNS")
+                self.assertIn((512, 512, 2), icon.info["sizes"])
+
+            ico_path = gen_icon.build_windows_icon(temp_path, master)
+            with Image.open(ico_path) as icon:
+                self.assertEqual(
+                    icon.ico.sizes(),
+                    {(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)},
+                )
 
     def test_windows_workflow_checks_actual_health_contract(self):
         workflow = (

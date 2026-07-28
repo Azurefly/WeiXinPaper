@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 block_cipher = None
+PROJECT_ROOT = Path(SPEC).resolve().parent.parent
 
 # 数据文件：(源路径, 目标路径)
 # spec 文件在 build_scripts/ 目录下，源路径需 ../
@@ -129,8 +130,12 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# macOS 图标
-icon_path = "../build_assets/AppIcon.icns" if sys.platform == "darwin" else "../build_assets/AppIcon.ico"
+# 图标路径必须按 spec 文件定位。普通 Path("../build_assets/...") 会按构建
+# 命令的 cwd 解析并误判为不存在，导致 PyInstaller 静默回退默认图标。
+icon_name = "AppIcon.icns" if sys.platform == "darwin" else "AppIcon.ico"
+icon_path = str(PROJECT_ROOT / "build_assets" / icon_name)
+if not Path(icon_path).is_file():
+    raise FileNotFoundError(f"缺少应用图标: {icon_path}")
 
 exe = EXE(
     pyz,
@@ -148,7 +153,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_path if Path(icon_path).exists() else None,
+    icon=icon_path,
 )
 
 coll = COLLECT(
@@ -167,7 +172,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         coll,
         name="公众号 AI Studio.app",
-        icon=icon_path if Path(icon_path).exists() else None,
+        icon=icon_path,
         bundle_identifier="com.studio.wechat-ai",
         info_plist={
             "CFBundleName": "公众号 AI Studio",

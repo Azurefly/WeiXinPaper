@@ -174,6 +174,8 @@ desktop_windows.cmd        # Windows
 
 ### 构建 macOS .app 应用包
 
+应用图标以 `build_assets/AppIconSource.png` 为透明高分辨率母版。生成脚本会保留圆角外的透明安全区，并输出 macOS ICNS、Windows 多尺寸 ICO 和通用 PNG。
+
 ```bash
 # 1. 生成应用图标（.icns + .ico + .png）
 python build_scripts/gen_icon.py build_assets
