@@ -81,6 +81,9 @@ class DesktopReleaseTests(unittest.TestCase):
             / "windows-desktop-build.yml"
         ).read_text(encoding="utf-8")
         self.assertIn('PYTHONUTF8: "1"', workflow)
+        self.assertIn("actions/checkout@v6", workflow)
+        self.assertIn("actions/setup-python@v6", workflow)
+        self.assertIn("actions/upload-artifact@v7", workflow)
         self.assertIn("$response.ok -eq $true", workflow)
         self.assertIn("if ($process.HasExited)", workflow)
         self.assertIn('ArgumentList "--server-only"', workflow)
