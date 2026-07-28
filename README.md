@@ -153,3 +153,54 @@ verify_browser_service.cmd
 - `docs/2.1.3_发布门禁状态.md`
 - `docs/2.1.3_数据库迁移与回滚.md`
 - `docs/2.1.3_外部链路验证结果.json`
+
+## 桌面端模式
+
+除浏览器访问外，项目支持以原生桌面窗口运行（基于 PyWebView），提供企业级生命周期管理。
+
+### 快速启动
+
+```bash
+# 安装桌面端依赖
+pip install pywebview Pillow
+
+# 直接启动桌面窗口
+python desktop.py
+
+# 或使用便捷脚本
+./desktop_unix.sh          # Linux / macOS
+desktop_windows.cmd        # Windows
+```
+
+### 构建 macOS .app 应用包
+
+```bash
+# 1. 生成应用图标（.icns + .ico + .png）
+python build_scripts/gen_icon.py build_assets
+
+# 2. 构建 .app 应用包
+python build_scripts/build_desktop.py
+```
+
+构建完成后双击 `公众号 AI Studio.app` 即可启动，Dock 显示自定义品牌图标。
+
+### 构建 Windows 启动目录
+
+在 Windows 上运行：
+
+```powershell
+python build_scripts\gen_icon.py build_assets
+python build_scripts\build_desktop.py
+```
+
+生成 `公众号 AI Studio (Windows)/` 目录，包含 VBS 无控制台启动器和 .ico 图标。运行 `创建桌面快捷方式.ps1` 可创建带图标的桌面快捷方式。
+
+### 桌面端特性
+
+- 单实例锁定：防止重复启动
+- 数据隔离：优先使用 OS 标准目录，不可写时回退便携模式
+- 启动加载页：服务器就绪前显示品牌加载动画
+- 窗口状态持久化：记住窗口尺寸
+- 优雅关闭：服务器线程安全停止 + 超时保护
+- 信号处理：支持 Ctrl+C / kill 优雅退出
+- macOS Dock 集成：自定义品牌图标、常规应用策略
