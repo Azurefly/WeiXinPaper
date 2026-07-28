@@ -64,7 +64,20 @@ jobs:
           $env:STUDIO_MASTER_KEY_FILE = Join-Path $smokeDir ".master.key"
           $env:STUDIO_LOG_FILE = $smokeLog
 
-          $process = Start-Process -FilePath $exe -WorkingDirectory $appDir -PassThru
+          $listener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            0
+          )
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $env:STUDIO_PORT = "$port"
+
+          $process = Start-Process `
+            -FilePath $exe `
+            -ArgumentList "--server-only" `
+            -WorkingDirectory $appDir `
+            -PassThru
           $healthy = $false
           $failure = ""
           try {
@@ -75,7 +88,7 @@ jobs:
               }
               try {
                 $response = Invoke-RestMethod `
-                  -Uri "http://127.0.0.1:5001/api/v2/health" `
+                  -Uri "http://127.0.0.1:$port/api/v2/health" `
                   -NoProxy `
                   -TimeoutSec 2
                 if ($response.ok -eq $true) {

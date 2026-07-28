@@ -83,9 +83,27 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertIn('PYTHONUTF8: "1"', workflow)
         self.assertIn("$response.ok -eq $true", workflow)
         self.assertIn("if ($process.HasExited)", workflow)
-        self.assertIn("http://127.0.0.1:5001/api/v2/health", workflow)
+        self.assertIn('ArgumentList "--server-only"', workflow)
+        self.assertIn("http://127.0.0.1:$port/api/v2/health", workflow)
+        self.assertIn("TcpListener", workflow)
         self.assertIn("-NoProxy", workflow)
         self.assertNotIn("foreach ($port in 5001..5020)", workflow)
+
+    def test_server_only_mode_requires_and_reserves_exact_port(self):
+        with mock.patch.object(desktop, "find_available_port", return_value=51423) as find:
+            with mock.patch.dict(os.environ, {"STUDIO_PORT": "51423"}, clear=True):
+                self.assertEqual(desktop.select_server_port(server_only=True), 51423)
+        find.assert_called_once_with(start=51423, max_tries=1)
+
+        with mock.patch.dict(os.environ, {"STUDIO_PORT": "invalid"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "有效的 STUDIO_PORT"):
+                desktop.select_server_port(server_only=True)
+
+    def test_backend_starts_before_gui_runtime_is_imported(self):
+        source = (Path(__file__).resolve().parents[1] / "desktop.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(source.index("server_thread.start()"), source.index("import webview"))
 
     def test_build_console_replaces_unencodable_status_characters(self):
         stdout = mock.Mock()

@@ -326,6 +326,26 @@ def find_available_port(start: int = SERVER_START_PORT, max_tries: int = 20) -> 
     raise RuntimeError(f"无法找到可用端口（尝试 {start}~{start + max_tries - 1}）")
 
 
+def select_server_port(server_only: bool = False) -> int:
+    """选择后端端口。
+
+    常规桌面模式继续从项目约定端口开始自动探测。仅供打包产物诊断使用的
+    ``--server-only`` 模式必须通过 ``STUDIO_PORT`` 指定单一端口，避免
+    CI 把其他进程占用的 5001 误认为当前应用，也避免应用静默改用后续端口。
+    """
+    if not server_only:
+        return find_available_port()
+
+    raw_port = os.environ.get("STUDIO_PORT", "").strip()
+    try:
+        requested = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError("server-only 模式需要有效的 STUDIO_PORT") from exc
+    if not 1024 <= requested <= 65535:
+        raise RuntimeError("server-only 模式的 STUDIO_PORT 必须在 1024~65535 之间")
+    return find_available_port(start=requested, max_tries=1)
+
+
 # ---------------------------------------------------------------------------
 # 服务器就绪检查
 # ---------------------------------------------------------------------------
@@ -484,26 +504,20 @@ def shutdown_server(server: object) -> None:
 
 def main() -> None:
     debug = "--debug" in sys.argv
+    server_only = "--server-only" in sys.argv
 
-    # 1. 检查 pywebview 依赖
-    try:
-        import webview
-    except ImportError:
-        show_error(APP_TITLE, "缺少 pywebview 依赖。\n\n请运行：\npip install pywebview")
-        sys.exit(1)
-
-    # 2. 配置环境（数据/日志目录 + 迁移）
+    # 1. 配置环境（数据/日志目录 + 迁移）
     data_dir = configure_environment()
 
-    # 3. 单实例检查
+    # 2. 单实例检查
     lock_sock = acquire_single_instance_lock()
     if lock_sock is None:
         show_warning(APP_TITLE, "程序已在运行中，请勿重复启动。")
         sys.exit(0)
 
-    # 4. 查找可用端口
+    # 3. 查找可用端口
     try:
-        port = find_available_port()
+        port = select_server_port(server_only)
     except RuntimeError as exc:
         show_error(APP_TITLE, str(exc))
         sys.exit(1)
@@ -512,7 +526,7 @@ def main() -> None:
     url = f"http://{host}:{port}/"
     os.environ["STUDIO_PORT"] = str(port)
 
-    # 5. 启动后端服务器（守护线程）
+    # 4. 初始化后端服务器
     from runtime_security import validate_runtime_security
     from server import VERSION, create_server
 
@@ -524,6 +538,19 @@ def main() -> None:
         show_error(APP_TITLE, f"服务器初始化失败：\n{exc}")
         sys.exit(1)
 
+    # CI/支持诊断模式：运行与桌面端完全相同的打包后端，但不初始化 GUI。
+    # GitHub Hosted Runner 没有可交互桌面，不适合作为 WebView2 窗口验收环境。
+    if server_only:
+        print(f"{APP_TITLE} {VERSION} server-only → {url}")
+        try:
+            server.serve_forever(poll_interval=0.2)
+        finally:
+            server.server_close()
+            lock_sock.close()
+        return
+
+    # 5. 后端先启动，再导入 GUI 运行时。Windows 上 pythonnet/WebView2 的
+    # 初始化即使异常或阻塞，也不能阻断本地服务完成启动和留下诊断信号。
     server_error: list[str] = []
 
     def _serve() -> None:
@@ -535,15 +562,24 @@ def main() -> None:
     server_thread = threading.Thread(target=_serve, daemon=True, name="StudioServer")
     server_thread.start()
 
-    # 6. 加载窗口尺寸
+    # 6. 检查 pywebview 依赖
+    try:
+        import webview
+    except ImportError:
+        shutdown_server(server)
+        lock_sock.close()
+        show_error(APP_TITLE, "缺少 pywebview 依赖。\n\n请运行：\npip install pywebview")
+        sys.exit(1)
+
+    # 7. 加载窗口尺寸
     saved = load_window_state(data_dir)
     win_w, win_h = window_dimensions(saved)
 
-    # 7. macOS Dock 集成 + WebKit 目录
+    # 8. macOS Dock 集成 + WebKit 目录
     _ensure_webkit_dirs()
     _configure_macos_dock()
 
-    # 8. 创建窗口（先显示加载页）
+    # 9. 创建窗口（先显示加载页）
     window = webview.create_window(
         title=f"{APP_TITLE} {VERSION}",
         html=LOADING_HTML,
@@ -555,7 +591,7 @@ def main() -> None:
         confirm_close=False,
     )
 
-    # 9. 后台线程：等待服务器就绪 → 导航到实际页面
+    # 10. 后台线程：等待服务器就绪 → 导航到实际页面
     nav_stop = threading.Event()
 
     def _navigate_when_ready() -> None:
@@ -574,7 +610,7 @@ def main() -> None:
     nav_thread = threading.Thread(target=_navigate_when_ready, daemon=True, name="StudioNav")
     nav_thread.start()
 
-    # 10. 后台线程：周期性保存窗口尺寸
+    # 11. 后台线程：周期性保存窗口尺寸
     def _periodic_save() -> None:
         while not nav_stop.is_set():
             time.sleep(3)
@@ -593,7 +629,7 @@ def main() -> None:
     save_thread = threading.Thread(target=_periodic_save, daemon=True, name="StudioWinSave")
     save_thread.start()
 
-    # 11. 信号处理（Ctrl+C / kill）
+    # 12. 信号处理（Ctrl+C / kill）
     def _signal_handler(signum: int, frame: object) -> None:
         nav_stop.set()
         shutdown_server(server)
@@ -602,11 +638,11 @@ def main() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    # 12. 启动 PyWebView（阻塞直到窗口关闭）
+    # 13. 启动 PyWebView（阻塞直到窗口关闭）
     print(f"{APP_TITLE} {VERSION} 桌面版已启动 → {url}")
     webview.start(debug=debug)
 
-    # 13. 窗口关闭后清理
+    # 14. 窗口关闭后清理
     nav_stop.set()
     shutdown_server(server)
     try:
