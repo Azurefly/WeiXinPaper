@@ -57,29 +57,42 @@ jobs:
             throw "Missing packaged dependency directory: _internal"
           }
 
+          $smokeDir = Join-Path $env:RUNNER_TEMP "wechat-ai-studio-smoke"
+          New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null
+          $smokeLog = Join-Path $smokeDir "studio.log"
+          $env:STUDIO_DB = Join-Path $smokeDir "studio.db"
+          $env:STUDIO_MASTER_KEY_FILE = Join-Path $smokeDir ".master.key"
+          $env:STUDIO_LOG_FILE = $smokeLog
+
           $process = Start-Process -FilePath $exe -WorkingDirectory $appDir -PassThru
           $healthy = $false
+          $failure = ""
           try {
             for ($attempt = 0; $attempt -lt 60 -and -not $healthy; $attempt++) {
-              foreach ($port in 5001..5020) {
-                try {
-                  $response = Invoke-RestMethod `
-                    -Uri "http://127.0.0.1:$port/api/v2/health" `
-                    -TimeoutSec 1
-                  if ($response.ok -eq $true) {
-                    $healthy = $true
-                    break
-                  }
-                } catch {
-                  # The next port/attempt may be the packaged app.
+              if ($process.HasExited) {
+                $failure = "Packaged process exited early with code $($process.ExitCode)."
+                break
+              }
+              try {
+                $response = Invoke-RestMethod `
+                  -Uri "http://127.0.0.1:5001/api/v2/health" `
+                  -TimeoutSec 2
+                if ($response.ok -eq $true) {
+                  $healthy = $true
                 }
+              } catch {
+                $failure = $_.Exception.Message
               }
               if (-not $healthy) {
                 Start-Sleep -Seconds 1
               }
             }
             if (-not $healthy) {
-              throw "Packaged application did not expose a healthy local server."
+              if (Test-Path $smokeLog -PathType Leaf) {
+                Write-Host "=== Packaged application log ==="
+                Get-Content $smokeLog -Tail 200
+              }
+              throw "Packaged application did not expose a healthy local server. $failure"
             }
           } finally {
             if (-not $process.HasExited) {
