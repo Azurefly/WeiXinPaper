@@ -30,8 +30,13 @@ from pathlib import Path
 # 路径与常量
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent
-BACKEND = ROOT / "backend"
+# PyInstaller 打包后，资源在 sys._MEIPASS 临时目录中
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    ROOT = Path(sys._MEIPASS)
+    BACKEND = ROOT / "backend"
+else:
+    ROOT = Path(__file__).resolve().parent
+    BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
 APP_NAME = "公众号AIStudio"
@@ -129,23 +134,40 @@ def _is_writable(path: Path) -> bool:
         return False
 
 
+def _portable_data_dir() -> Path:
+    """获取便携模式数据目录（可执行文件旁的 data/ 文件夹）。
+
+    macOS .app bundle 内部只读，数据目录需放在 .app 外部。
+    Windows 直接放在 .exe 旁。
+    """
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        # macOS .app bundle: exe = .../App.app/Contents/MacOS/exe
+        # 需要回到 .app 所在目录
+        if sys.platform == "darwin" and exe.parent.name == "MacOS":
+            return exe.parent.parent.parent.parent / "data"
+        # Windows 或非 bundle 模式：可执行文件旁
+        return exe.parent / "data"
+    return ROOT / "data"
+
+
 def configure_environment() -> Path:
     """配置数据/日志目录环境变量，返回数据目录。
 
     优先使用 OS 标准目录（~/Library/Application Support），
-    若不可写则回退到项目目录下的 data/ 文件夹（便携模式）。
+    若不可写则回退到可执行文件旁的 data/ 文件夹（便携模式）。
     首次运行自动迁移现有数据。
     """
     os_data = app_data_dir()
     os_log = app_log_dir()
 
-    # 优先 OS 标准目录，不可写时回退到项目目录（便携模式）
+    # 优先 OS 标准目录，不可写时回退到便携模式
     if _is_writable(os_data):
         data_dir = os_data
-        log_dir = os_log if _is_writable(os_log) else ROOT / "data"
+        log_dir = os_log if _is_writable(os_log) else _portable_data_dir()
     else:
-        data_dir = ROOT / "data"
-        log_dir = ROOT / "data"
+        data_dir = _portable_data_dir()
+        log_dir = _portable_data_dir()
         print(f"[配置] OS 数据目录不可写，回退到便携模式: {data_dir}")
 
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -165,13 +187,29 @@ def configure_environment() -> Path:
 
 
 def _migrate_existing_data(data_dir: Path) -> None:
-    """首次运行时将项目目录下的数据库迁移到 OS 标准数据目录。"""
+    """首次运行时将旧数据库迁移到数据目录。"""
     new_db = data_dir / "studio.db"
     if new_db.exists():
         return  # 新目录已有数据，不迁移
 
-    old_db = ROOT / "data" / "studio.db"
-    if not old_db.exists():
+    # 查找旧数据库：源码目录或可执行文件旁
+    candidates = []
+    if not getattr(sys, "frozen", False):
+        candidates.append(ROOT / "data" / "studio.db")
+    else:
+        exe = Path(sys.executable).resolve()
+        if sys.platform == "darwin" and exe.parent.name == "MacOS":
+            # .app bundle 旁
+            candidates.append(exe.parent.parent.parent.parent / "data" / "studio.db")
+        candidates.append(exe.parent / "data" / "studio.db")
+        candidates.append(exe.parent.parent / "data" / "studio.db")
+
+    old_db = None
+    for c in candidates:
+        if c.exists():
+            old_db = c
+            break
+    if not old_db:
         return  # 旧目录没有数据，无需迁移
 
     try:
@@ -180,6 +218,14 @@ def _migrate_existing_data(data_dir: Path) -> None:
             old_side = old_db.parent / (old_db.name + suffix)
             if old_side.exists():
                 shutil.copy2(old_side, new_db.parent / (new_db.name + suffix))
+        # 同步迁移 master key（数据库与密钥必须成对）
+        old_key = old_db.parent / ".master.key"
+        if old_key.exists():
+            shutil.copy2(old_key, new_db.parent / ".master.key")
+            try:
+                os.chmod(new_db.parent / ".master.key", 0o600)
+            except Exception:  # noqa: BLE001
+                pass
         print(f"[迁移] 数据库已从 {old_db} 复制到 {new_db}")
     except Exception as exc:  # noqa: BLE001
         print(f"[迁移] 数据迁移失败: {exc}", file=sys.stderr)
@@ -293,6 +339,19 @@ def show_warning(title: str, message: str) -> None:
 # macOS Dock 集成
 # ---------------------------------------------------------------------------
 
+def _ensure_webkit_dirs() -> None:
+    """确保 macOS WebKit 数据目录存在（减少启动警告）。"""
+    if sys.platform != "darwin":
+        return
+    webkit_base = Path.home() / "Library" / "WebKit" / "com.studio.wechat-ai"
+    try:
+        webkit_base.mkdir(parents=True, exist_ok=True)
+        for subdir in ["WebsiteData", "Caches", "Cookies"]:
+            (webkit_base / subdir).mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass  # 沙箱环境下可能无法创建，不影响核心功能
+
+
 def _configure_macos_dock() -> None:
     """在 macOS 上将 Python 进程设为常规应用（Dock 图标 + 菜单栏）。"""
     if sys.platform != "darwin":
@@ -320,17 +379,22 @@ def _configure_macos_dock() -> None:
 
 def _find_macos_icon() -> Path | None:
     """查找可用的 .icns 图标文件。"""
-    # 1. .app bundle 内嵌图标
+    # 1. .app bundle 内嵌图标（PyInstaller 打包后）
     exe = Path(sys.executable).resolve()
     for parent in [exe, *exe.parents]:
         icns = parent / "Contents" / "Resources" / "AppIcon.icns"
         if icns.exists():
             return icns
-    # 2. 项目目录 build_assets
+    # 2. 打包资源目录（_MEIPASS）
+    if hasattr(sys, "_MEIPASS"):
+        meipass_icon = Path(sys._MEIPASS) / "build_assets" / "AppIcon.icns"
+        if meipass_icon.exists():
+            return meipass_icon
+    # 3. 项目目录 build_assets
     project_icon = ROOT / "build_assets" / "AppIcon.icns"
     if project_icon.exists():
         return project_icon
-    # 3. 回退到 PNG
+    # 4. 回退到 PNG
     project_png = ROOT / "build_assets" / "AppIcon.png"
     if project_png.exists():
         return project_png
@@ -419,7 +483,8 @@ def main() -> None:
     win_w = max(1024, min(int(saved.get("width", 1440)), 2560))
     win_h = max(680, min(int(saved.get("height", 900)), 1600))
 
-    # 7. macOS Dock 集成
+    # 7. macOS Dock 集成 + WebKit 目录
+    _ensure_webkit_dirs()
     _configure_macos_dock()
 
     # 8. 创建窗口（先显示加载页）

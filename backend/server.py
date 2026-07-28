@@ -58,7 +58,11 @@ from workflow import cancel_workflow, create_workflow, mark_interrupted_tasks, r
 
 access_logger = get_logger("access")
 
-ROOT = Path(__file__).resolve().parent.parent
+# PyInstaller 打包后，资源在 sys._MEIPASS 临时目录中
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    ROOT = Path(sys._MEIPASS)
+else:
+    ROOT = Path(__file__).resolve().parent.parent
 WEB_ROOT = ROOT / "web"
 VERSION = "2.1.3"
 MUTATING = {"POST", "PUT", "PATCH", "DELETE"}

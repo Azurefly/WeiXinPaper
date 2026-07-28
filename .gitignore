@@ -15,3 +15,12 @@ system-critique/
 
 # macOS .app 构建产物（由 build_app_bundle.py 生成）
 *.app/
+
+# PyInstaller 构建产物
+build/
+dist/
+.pyinstaller_cache/
+.pyinstaller_config/
+
+# 桌面端数据目录（运行时生成）
+公众号 AI Studio.app/Contents/MacOS/data/
