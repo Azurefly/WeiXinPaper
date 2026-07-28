@@ -348,7 +348,7 @@
       <div class="meta-item">版本：<strong>2.1.3</strong></div>
       <div class="meta-item">分支：<strong>desktop-release</strong></div>
       <div class="meta-item">日期：<strong>2026-07-28</strong></div>
-      <div class="meta-item">功能 / CI 提交：<strong>14</strong></div>
+      <div class="meta-item">功能 / CI 提交：<strong>15</strong></div>
     </div>
   </div>
 </div>
@@ -362,19 +362,19 @@
 
   <div class="status-grid">
     <div class="status-card">
-      <div class="num">14</div>
+      <div class="num">15</div>
       <div class="label">功能 / CI 提交</div>
     </div>
     <div class="status-card">
-      <div class="num">84.6<span style="font-size:16px">MB</span></div>
+      <div class="num">87.7<span style="font-size:16px">MB</span></div>
       <div class="label">macOS .app 体积</div>
     </div>
     <div class="status-card">
-      <div class="num success">54</div>
+      <div class="num success">55</div>
       <div class="label">核心 + 桌面端测试通过</div>
     </div>
     <div class="status-card">
-      <div class="num success">21.8<span style="font-size:16px">MB</span></div>
+      <div class="num success">23.9<span style="font-size:16px">MB</span></div>
       <div class="label">Windows CI artifact</div>
     </div>
   </div>
@@ -422,6 +422,7 @@
   <span class="file">build_desktop.py</span> <span class="size">— 统一构建脚本</span>
   <span class="file">gen_icon.py</span>      <span class="size">— 图标生成（.icns/.ico/.png）</span>
 <span class="dir">build_assets/</span>
+  <span class="file">AppIconSource.png</span> <span class="size">— 透明高分辨率图标母版</span>
   <span class="file">AppIcon.icns</span>     <span class="size">— macOS 图标</span>
   <span class="file">AppIcon.ico</span>      <span class="size">— Windows 图标</span>
   <span class="file">AppIcon.png</span>      <span class="size">— 通用图标</span>
@@ -528,7 +529,7 @@
       <div class="phase-commit">commit 0a89682</div>
       <div class="phase-desc">
         <ul>
-          <li>gen_icon.py：PIL 生成品牌图标（.icns / .ico / .png）</li>
+          <li>gen_icon.py：从透明母版生成品牌图标（.icns / 多尺寸 .ico / .png）</li>
           <li>build_desktop.py：统一构建脚本（macOS + Windows）</li>
           <li>desktop.spec：PyInstaller 打包配置</li>
           <li>requirements-desktop.txt：桌面端依赖声明</li>
@@ -562,21 +563,24 @@
         <span class="phase-title">阶段八：Windows 打包与自动验证</span>
         <span class="phase-tag tag-done">已完成</span>
       </div>
-      <div class="phase-commit">commit 829db45 → c5d8d37</div>
+      <div class="phase-commit">commit 829db45 → 2c5ad3b</div>
       <div class="phase-desc">
         <ul>
           <li>已修复 Python.framework 符号链接被解引用导致的签名假通过</li>
           <li>已修复 master key 路径落入 .app bundle、造成健康检查 500 和签名失效</li>
-          <li>macOS 干净重建 84.6MB，codesign deep + strict 通过，启动后签名仍有效</li>
+          <li>macOS 使用新图标干净重建 87.7MB，codesign deep + strict 通过</li>
           <li>双击启动模拟通过，health check 返回 200</li>
-          <li>桌面端回归扩展至 9 项，当前核心 45 + 桌面端 9 项全部通过</li>
+          <li>桌面端回归扩展至 10 项，当前核心 45 + 桌面端 10 项全部通过</li>
           <li>Windows 2022 CI：构建 .exe、检查 _internal、启动 server-only 后轮询动态端口健康端点</li>
           <li>Windows CI #1 已运行：依赖与测试通过；定位并修复 cp1252 控制台编码崩溃</li>
           <li>Windows CI #2～#4：依次排除超时探测、固定端口和 runner 代理干扰</li>
           <li>Windows CI #5 全链路通过，首次生成可下载 artifact</li>
           <li>Windows CI #6 使用 Node.js 24 官方 Actions 再次通过，无弃用警告</li>
-          <li>最终 artifact：22,872,651 字节（21.8MB），保留至 2026-08-11</li>
-          <li>artifact digest：sha256:391b06e493694d3a76c6284ac62c4b34e77e2ddc2408a05f51a6b48425aaca6e</li>
+          <li>替换为用户提供的新图标：透明边缘、约 8% 安全区、16～1024px 多尺寸适配</li>
+          <li>修复 spec 相对路径误判导致 PyInstaller 静默使用默认图标的问题</li>
+          <li>macOS .app 内嵌 1024px ICNS 与源像素一致；Windows 日志确认 “Copying icon to EXE”</li>
+          <li>Windows CI #7 全链路通过，最终 artifact：25,052,345 字节（23.9MB）</li>
+          <li>artifact digest：sha256:502b9770f39354f13207f57f408849318a29731a62baf286a95fbd408f3e3cd5</li>
           <li>所有修复已提交并推送 desktop-release 分支</li>
         </ul>
       </div>
@@ -616,7 +620,7 @@
       <span class="check">✓</span>
       <div class="item-content">
         <div class="item-title">自定义品牌图标</div>
-        <div class="item-desc">PIL 生成 "公" 字品牌图标，支持 .icns / .ico / .png 三种格式</div>
+        <div class="item-desc">采用用户提供的内容创作图标，透明化外部白边并保留阴影，支持 16～1024px 的 .icns / 多尺寸 .ico / .png</div>
       </div>
     </li>
     <li>
@@ -679,7 +683,7 @@
       <span class="check">✓</span>
       <div class="item-content">
         <div class="item-title">Windows .exe 自动打包验证</div>
-        <div class="item-desc">Windows 2022 CI #6 全部步骤通过，已归档 21.8MB artifact、SHA256 和健康检查证据</div>
+        <div class="item-desc">Windows 2022 CI #7 全部步骤通过，日志确认图标写入 EXE，已归档 23.9MB artifact、SHA256 和健康检查证据</div>
       </div>
     </li>
   </ul>
@@ -709,6 +713,11 @@
         </tr>
       </thead>
       <tbody>
+        <tr>
+          <td><code>2c5ad3b</code></td>
+          <td>feat</td>
+          <td>采用用户提供的新图标，适配透明边缘、ICNS/ICO/PNG 与跨平台打包</td>
+        </tr>
         <tr>
           <td><code>c5d8d37</code></td>
           <td>ci</td>
@@ -804,27 +813,27 @@
         <tr>
           <td>本地回归</td>
           <td>通过</td>
-          <td>54 / 54：核心 45 + 桌面端 9</td>
+          <td>55 / 55：核心 45 + 桌面端 10</td>
         </tr>
         <tr>
           <td>macOS 独立应用</td>
           <td>通过</td>
-          <td>84.6MB；deep + strict 验签；启动健康检查 200；启动后签名有效</td>
+          <td>87.7MB；内嵌 1024px 新 ICNS；deep + strict 验签；启动健康检查 200</td>
         </tr>
         <tr>
-          <td>Windows CI #6</td>
+          <td>Windows CI #7</td>
           <td>通过</td>
-          <td>run 30358546418；build-and-smoke-test 51 秒；无 annotations</td>
+          <td>run 30360571536；测试、构建、图标写入 EXE、健康检查和上传全部成功</td>
         </tr>
         <tr>
           <td>Windows artifact</td>
           <td>已归档</td>
-          <td>wechat-ai-studio-windows；21.8MB；artifact 8687816900；2026-08-11 到期</td>
+          <td>wechat-ai-studio-windows；23.9MB；artifact 8688623921；2026-08-11 到期</td>
         </tr>
         <tr>
           <td>远程分支</td>
           <td>已推送</td>
-          <td><code>desktop-release</code>，功能 / CI 基线 <code>c5d8d37</code></td>
+          <td><code>desktop-release</code>，功能 / CI 基线 <code>2c5ad3b</code></td>
         </tr>
       </tbody>
     </table>
@@ -933,9 +942,9 @@ python build_scripts\build_desktop.py --windows --clean
 <!-- 总结 -->
 <section>
   <h2>总结</h2>
-  <p>从 2.1.3 审计修复源码出发，阶段八“Windows 打包与自动验证”已经完成，当前进入<strong>阶段九：Windows 实机交互验收</strong>。macOS .app 已完成干净重建，体积从错误解引用符号链接时的 152.8MB 降至 84.6MB；严格签名验证、双击启动模拟和健康检查 200 均已通过，且启动后 bundle 签名保持有效。</p>
+  <p>从 2.1.3 审计修复源码出发，阶段八“Windows 打包与自动验证”已经完成，当前进入<strong>阶段九：Windows 实机交互验收</strong>。macOS .app 使用新图标完成 87.7MB 干净重建；内嵌 1024px ICNS 与源图标像素一致，严格签名验证、双击启动模拟和健康检查 200 均已通过。</p>
 
-  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，macOS 可双击 .app 启动，Windows 已生成完整 .exe 目录 artifact</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 9 项桌面端回归测试全部通过。Windows 2022 CI #6 的构建、单元测试、打包后端健康检查和 artifact 上传全部成功。</p>
+  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，macOS 可双击 .app 启动，Windows 已生成带新图标的完整 .exe 目录 artifact</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 10 项桌面端回归测试全部通过。Windows 2022 CI #7 的构建、图标写入 EXE、打包后端健康检查和 artifact 上传全部成功。</p>
 
   <p>唯一剩余外部门禁：在 Windows 10 / 11 有交互桌面、未安装 Python 的实机上解压 artifact，完成 WebView2 窗口、首次启动、关闭重启和单实例行为验收。GitHub Hosted Runner 无法替代这项人工 GUI 验收。</p>
 </section>
