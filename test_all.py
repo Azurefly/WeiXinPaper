@@ -18,7 +18,17 @@ def run(command: list[str]) -> None:
 def main() -> None:
     if not compileall.compile_dir(ROOT / "backend", quiet=1):
         raise SystemExit("Python 语法检查失败")
-    run([sys.executable, "-m", "unittest", "-v", "tests.test_release", "tests.test_security_211", "tests.test_audit_212", "tests.test_audit_213"])
+    run([
+        sys.executable,
+        "-m",
+        "unittest",
+        "-v",
+        "tests.test_release",
+        "tests.test_security_211",
+        "tests.test_audit_212",
+        "tests.test_audit_213",
+        "tests.test_desktop",
+    ])
     node = shutil.which("node")
     if node:
         run([node, "--check", "web/app.js"])

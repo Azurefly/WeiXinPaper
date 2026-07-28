@@ -146,7 +146,10 @@ def build_macos(clean: bool = False) -> None:
     root_app = PROJECT_ROOT / f"{APP_NAME}.app"
     if root_app.exists():
         shutil.rmtree(root_app)
-    shutil.copytree(app_bundle, root_app)
+    # macOS framework 依赖符号链接维持标准 bundle 结构。copytree 默认会解引用
+    # 符号链接，导致 Python.framework/Versions/Current 变成实体目录，最终使
+    # codesign 报 "bundle format is ambiguous"。
+    shutil.copytree(app_bundle, root_app, symlinks=True)
     print(f"✓ 已复制到项目根目录: {root_app}")
 
     # 清理缓存目录（避免 codesign 失败）
@@ -162,33 +165,59 @@ def build_macos(clean: bool = False) -> None:
     print("Ad-hoc 签名...")
     # 1. 签名所有动态库
     for dylib in root_app.rglob("*.dylib"):
-        subprocess.call(["codesign", "--force", "--sign", "-", str(dylib)],
-                       stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["codesign", "--force", "--sign", "-", str(dylib)],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
     # 2. 签名所有 .so 文件
     for so in root_app.rglob("*.so"):
-        subprocess.call(["codesign", "--force", "--sign", "-", str(so)],
-                       stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    # 3. 签名主可执行文件
+        subprocess.check_call(
+            ["codesign", "--force", "--sign", "-", str(so)],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+    # 3. 重新签名嵌套 Python framework
+    python_framework = root_app / "Contents" / "Frameworks" / "Python.framework"
+    if python_framework.exists():
+        subprocess.check_call(
+            ["codesign", "--force", "--sign", "-", str(python_framework)],
+            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+    # 4. 签名主可执行文件
     exe = root_app / "Contents" / "MacOS" / APP_NAME
-    subprocess.call(["codesign", "--force", "--sign", "-", str(exe)],
-                   stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    # 4. 签名整个 .app bundle
-    subprocess.call(["codesign", "--force", "--sign", "-", str(root_app)],
-                   stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    subprocess.check_call(
+        ["codesign", "--force", "--sign", "-", str(exe)],
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
+    # 5. 签名整个 .app bundle
+    subprocess.check_call(
+        ["codesign", "--force", "--sign", "-", str(root_app)],
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
 
     # 去除隔离属性
     print("去除隔离属性...")
-    subprocess.call(["xattr", "-cr", str(root_app)], stderr=subprocess.DEVNULL)
+    subprocess.check_call(["xattr", "-cr", str(root_app)], stderr=subprocess.DEVNULL)
 
-    # 验证签名（非致命，仅报告）
+    # 严格验证所有嵌套代码。签名失败属于发布阻断项，不能降级为警告。
     result = subprocess.run(
-        ["codesign", "--verify", "--verbose=2", str(root_app)],
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(root_app)],
         capture_output=True, text=True,
     )
-    if result.returncode == 0:
-        print("✓ 签名验证通过")
-    else:
-        print(f"⚠ 签名验证有警告（不影响运行，首次打开请右键→打开）")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        print(f"✗ 签名验证失败：\n{detail}", file=sys.stderr)
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+    print("✓ 签名验证通过（deep + strict）")
 
     # 显示大小
     size = sum(f.stat().st_size for f in root_app.rglob("*") if f.is_file())
@@ -234,6 +263,14 @@ def build_windows(clean: bool = False) -> None:
 
     if not win_dir.exists():
         print(f"✗ 构建失败：{win_dir} 不存在", file=sys.stderr)
+        sys.exit(1)
+    exe = win_dir / f"{APP_NAME}.exe"
+    internal_dir = win_dir / "_internal"
+    if not exe.is_file():
+        print(f"✗ 构建失败：缺少主程序 {exe.name}", file=sys.stderr)
+        sys.exit(1)
+    if not internal_dir.is_dir():
+        print("✗ 构建失败：缺少 _internal 依赖目录", file=sys.stderr)
         sys.exit(1)
 
     # 创建快捷方式脚本

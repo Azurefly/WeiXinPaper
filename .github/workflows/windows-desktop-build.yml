@@ -1,0 +1,97 @@
+name: Windows desktop build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - desktop-release
+    paths:
+      - "backend/**"
+      - "web/**"
+      - "build_assets/**"
+      - "build_scripts/**"
+      - "desktop.py"
+      - "requirements-desktop.txt"
+      - ".github/workflows/windows-desktop-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke-test:
+    runs-on: windows-2022
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-desktop.txt
+
+      - name: Install desktop build dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-desktop.txt
+
+      - name: Run desktop unit tests
+        run: python -m unittest -v tests.test_desktop
+
+      - name: Build Windows package
+        run: python build_scripts/build_desktop.py --windows --clean
+
+      - name: Smoke-test packaged server
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $PWD "dist\公众号 AI Studio"
+          $exe = Join-Path $appDir "公众号 AI Studio.exe"
+          if (-not (Test-Path $exe -PathType Leaf)) {
+            throw "Missing packaged executable: $exe"
+          }
+          if (-not (Test-Path (Join-Path $appDir "_internal") -PathType Container)) {
+            throw "Missing packaged dependency directory: _internal"
+          }
+
+          $process = Start-Process -FilePath $exe -WorkingDirectory $appDir -PassThru
+          $healthy = $false
+          try {
+            for ($attempt = 0; $attempt -lt 60 -and -not $healthy; $attempt++) {
+              foreach ($port in 5001..5020) {
+                try {
+                  $response = Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:$port/api/v2/health" `
+                    -TimeoutSec 1
+                  if ($response.ok -eq $true) {
+                    $healthy = $true
+                    break
+                  }
+                } catch {
+                  # The next port/attempt may be the packaged app.
+                }
+              }
+              if (-not $healthy) {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $healthy) {
+              throw "Packaged application did not expose a healthy local server."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
+          Get-FileHash -Algorithm SHA256 $exe |
+            Format-List |
+            Out-File -Encoding utf8 (Join-Path $appDir "SHA256.txt")
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: wechat-ai-studio-windows
+          path: "dist/公众号 AI Studio"
+          if-no-files-found: error
+          retention-days: 14

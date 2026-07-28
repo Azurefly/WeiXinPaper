@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import urllib.request
+from html import escape
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -175,6 +176,9 @@ def configure_environment() -> Path:
 
     # 数据库路径（仅在未手动指定时设置）
     os.environ.setdefault("STUDIO_DB", str(data_dir / "studio.db"))
+    # 密钥必须与数据库使用同一数据目录。若缺失此项，打包后的默认路径会
+    # 落入只读的 .app/Contents/Resources/data，造成密文无法解密并破坏签名。
+    os.environ.setdefault("STUDIO_MASTER_KEY_FILE", str(data_dir / ".master.key"))
     # 日志文件路径
     os.environ.setdefault("STUDIO_LOG_FILE", str(log_dir / "studio.log"))
     # 标记为桌面端模式（不自动打开浏览器）
@@ -226,6 +230,13 @@ def _migrate_existing_data(data_dir: Path) -> None:
                 os.chmod(new_db.parent / ".master.key", 0o600)
             except Exception:  # noqa: BLE001
                 pass
+        old_salt = old_db.parent / ".master.key.salt"
+        if old_salt.exists():
+            shutil.copy2(old_salt, new_db.parent / ".master.key.salt")
+            try:
+                os.chmod(new_db.parent / ".master.key.salt", 0o600)
+            except Exception:  # noqa: BLE001
+                pass
         print(f"[迁移] 数据库已从 {old_db} 复制到 {new_db}")
     except Exception as exc:  # noqa: BLE001
         print(f"[迁移] 数据迁移失败: {exc}", file=sys.stderr)
@@ -238,7 +249,12 @@ def _migrate_existing_data(data_dir: Path) -> None:
 def acquire_single_instance_lock() -> socket.socket | None:
     """尝试获取单实例锁。已有实例运行时返回 None。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows 的 SO_REUSEADDR 可能允许第二个进程抢占同一端口；独占绑定
+        # 才能可靠实现单实例。
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
         sock.listen(1)
@@ -270,10 +286,27 @@ def load_window_state(data_dir: Path) -> dict:
 
 def save_window_state(data_dir: Path, state: dict) -> None:
     path = _window_state_path(data_dir)
+    temp_path = path.with_suffix(".tmp")
     try:
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
     except Exception:  # noqa: BLE001
-        pass
+        temp_path.unlink(missing_ok=True)
+
+
+def window_dimensions(saved: dict) -> tuple[int, int]:
+    """读取并约束持久化窗口尺寸；损坏的状态文件安全回退到默认值。"""
+    def _bounded(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(saved.get(name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(value, maximum))
+
+    return (
+        _bounded("width", 1440, 1024, 2560),
+        _bounded("height", 900, 680, 1600),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,9 +336,9 @@ def wait_for_server(url: str, timeout: float = SERVER_START_TIMEOUT) -> bool:
     health_url = url.rstrip("/") + "/api/v2/health"
     while time.monotonic() < deadline:
         try:
-            req = urllib.request.urlopen(health_url, timeout=2)
-            if req.status == 200:
-                return True
+            with urllib.request.urlopen(health_url, timeout=2) as response:
+                if response.status == 200:
+                    return True
         except Exception:  # noqa: BLE001
             time.sleep(0.3)
     return False
@@ -316,6 +349,30 @@ def wait_for_server(url: str, timeout: float = SERVER_START_TIMEOUT) -> bool:
 # ---------------------------------------------------------------------------
 
 def _show_dialog(method: str, title: str, message: str) -> None:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            icon = 0x10 if method == "showerror" else 0x30
+            ctypes.windll.user32.MessageBoxW(None, message, title, icon | 0x0)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    elif sys.platform == "darwin":
+        try:
+            import AppKit  # type: ignore[import-not-found]
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_(title)
+            alert.setInformativeText_(message)
+            style = (
+                AppKit.NSAlertStyleCritical
+                if method == "showerror"
+                else AppKit.NSAlertStyleWarning
+            )
+            alert.setAlertStyle_(style)
+            alert.runModal()
+            return
+        except Exception:  # noqa: BLE001
+            pass
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -480,8 +537,7 @@ def main() -> None:
 
     # 6. 加载窗口尺寸
     saved = load_window_state(data_dir)
-    win_w = max(1024, min(int(saved.get("width", 1440)), 2560))
-    win_h = max(680, min(int(saved.get("height", 900)), 1600))
+    win_w, win_h = window_dimensions(saved)
 
     # 7. macOS Dock 集成 + WebKit 目录
     _ensure_webkit_dirs()
@@ -511,7 +567,7 @@ def main() -> None:
         else:
             msg = server_error[0] if server_error else "服务器启动超时"
             try:
-                window.load_html(ERROR_HTML_TEMPLATE.format(message=msg))
+                window.load_html(ERROR_HTML_TEMPLATE.format(message=escape(msg)))
             except Exception:  # noqa: BLE001
                 show_error(APP_TITLE, f"启动失败：{msg}")
 
