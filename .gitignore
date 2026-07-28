@@ -12,3 +12,6 @@ data/.master.key.*
 
 .trae-html-share-packages/
 system-critique/
+
+# macOS .app 构建产物（由 build_app_bundle.py 生成）
+*.app/

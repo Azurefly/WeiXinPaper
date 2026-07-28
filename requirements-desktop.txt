@@ -1,0 +1,6 @@
+# 桌面端额外依赖（在原有后端依赖基础上追加）
+# 原有后端仅需 Pillow（封面生成），无其他第三方包。
+
+# PyWebView — 将 Web 应用封装为原生桌面窗口
+# macOS 自动拉取 pyobjc-framework-WebKit；Windows 依赖 Edge WebView2 Runtime
+pywebview>=5.0
