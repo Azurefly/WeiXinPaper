@@ -348,7 +348,7 @@
       <div class="meta-item">版本：<strong>2.1.3</strong></div>
       <div class="meta-item">分支：<strong>desktop-release</strong></div>
       <div class="meta-item">日期：<strong>2026-07-28</strong></div>
-      <div class="meta-item">提交数：<strong>8</strong></div>
+      <div class="meta-item">功能 / CI 提交：<strong>14</strong></div>
     </div>
   </div>
 </div>
@@ -362,20 +362,20 @@
 
   <div class="status-grid">
     <div class="status-card">
-      <div class="num">8</div>
-      <div class="label">Git 提交</div>
+      <div class="num">14</div>
+      <div class="label">功能 / CI 提交</div>
     </div>
     <div class="status-card">
       <div class="num">84.6<span style="font-size:16px">MB</span></div>
       <div class="label">macOS .app 体积</div>
     </div>
     <div class="status-card">
-      <div class="num success">52</div>
+      <div class="num success">54</div>
       <div class="label">核心 + 桌面端测试通过</div>
     </div>
     <div class="status-card">
-      <div class="num warning">7</div>
-      <div class="label">本轮待提交文件</div>
+      <div class="num success">21.8<span style="font-size:16px">MB</span></div>
+      <div class="label">Windows CI artifact</div>
     </div>
   </div>
 </section>
@@ -406,7 +406,7 @@
 
   <h3>关键文件</h3>
   <div class="file-tree">
-<span class="dir">desktop.py</span> <span class="size">(564 行)</span>  <span class="size">— 桌面端启动器，PyWebView 窗口管理</span>
+<span class="dir">desktop.py</span> <span class="size">(656 行)</span>  <span class="size">— 桌面端启动器，PyWebView 窗口管理</span>
 <span class="dir">backend/</span>
   <span class="file">server.py</span>        <span class="size">— HTTP 服务器，支持 PyInstaller _MEIPASS</span>
   <span class="file">ai_engine.py</span>     <span class="size">— AI 引擎</span>
@@ -557,25 +557,41 @@
       </div>
     </div>
 
-    <div class="phase current">
+    <div class="phase done">
       <div class="phase-header">
-        <span class="phase-title">阶段八：Windows 打包与最终验证</span>
-        <span class="phase-tag tag-current">进行中</span>
+        <span class="phase-title">阶段八：Windows 打包与自动验证</span>
+        <span class="phase-tag tag-done">已完成</span>
       </div>
+      <div class="phase-commit">commit 829db45 → c5d8d37</div>
       <div class="phase-desc">
         <ul>
           <li>已修复 Python.framework 符号链接被解引用导致的签名假通过</li>
           <li>已修复 master key 路径落入 .app bundle、造成健康检查 500 和签名失效</li>
           <li>macOS 干净重建 84.6MB，codesign deep + strict 通过，启动后签名仍有效</li>
           <li>双击启动模拟通过，health check 返回 200</li>
-          <li>新增 7 项桌面端回归测试，当前核心 45 + 桌面端 7 项全部通过</li>
-          <li>新增 Windows 2022 CI：构建 .exe、检查 _internal、启动后轮询健康端点</li>
+          <li>桌面端回归扩展至 9 项，当前核心 45 + 桌面端 9 项全部通过</li>
+          <li>Windows 2022 CI：构建 .exe、检查 _internal、启动 server-only 后轮询动态端口健康端点</li>
           <li>Windows CI #1 已运行：依赖与测试通过；定位并修复 cp1252 控制台编码崩溃</li>
-          <li>Windows CI #2 已成功生成 .exe / _internal；正在收敛启动冒烟诊断</li>
-          <li>Windows CI #3 再次生成 43.1MB 包；定位 runner 代理拦截回环健康检查</li>
-          <li>待 Windows CI 冒烟通过后保存 artifact，并在 Windows 10/11 实机复核</li>
-          <li>在无 Python 环境的机器上验证双击启动</li>
-          <li>提交本轮修复并推送 desktop-release 分支</li>
+          <li>Windows CI #2～#4：依次排除超时探测、固定端口和 runner 代理干扰</li>
+          <li>Windows CI #5 全链路通过，首次生成可下载 artifact</li>
+          <li>Windows CI #6 使用 Node.js 24 官方 Actions 再次通过，无弃用警告</li>
+          <li>最终 artifact：22,872,651 字节（21.8MB），保留至 2026-08-11</li>
+          <li>artifact digest：sha256:391b06e493694d3a76c6284ac62c4b34e77e2ddc2408a05f51a6b48425aaca6e</li>
+          <li>所有修复已提交并推送 desktop-release 分支</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="phase current">
+      <div class="phase-header">
+        <span class="phase-title">阶段九：Windows 实机交互验收</span>
+        <span class="phase-tag tag-current">待实机</span>
+      </div>
+      <div class="phase-desc">
+        <ul>
+          <li>在 Windows 10 / 11 有交互桌面的机器上双击 .exe</li>
+          <li>确认 WebView2 窗口、首次数据目录创建、关闭重启与单实例提示</li>
+          <li>在未安装 Python 的目标机复核“解压即用”</li>
         </ul>
       </div>
     </div>
@@ -659,6 +675,13 @@
         <div class="item-desc">分步签名 .dylib / .so / Python.framework / 主程序，并以 deep + strict 强制验签</div>
       </div>
     </li>
+    <li>
+      <span class="check">✓</span>
+      <div class="item-content">
+        <div class="item-title">Windows .exe 自动打包验证</div>
+        <div class="item-desc">Windows 2022 CI #6 全部步骤通过，已归档 21.8MB artifact、SHA256 和健康检查证据</div>
+      </div>
+    </li>
   </ul>
 
   <h3>待完成</h3>
@@ -666,22 +689,8 @@
     <li>
       <span class="pending-icon">○</span>
       <div class="item-content">
-        <div class="item-title">Windows .exe 打包验证</div>
-        <div class="item-desc">工作流已就绪；需推送后在 Windows 2022 CI 或 Windows 10/11 实机运行并保存产物</div>
-      </div>
-    </li>
-    <li>
-      <span class="pending-icon">○</span>
-      <div class="item-content">
-        <div class="item-title">无环境机器验证</div>
-        <div class="item-desc">在未安装 Python 的 macOS / Windows 机器上验证双击启动</div>
-      </div>
-    </li>
-    <li>
-      <span class="pending-icon">○</span>
-      <div class="item-content">
-        <div class="item-title">提交本轮修复</div>
-        <div class="item-desc">签名、密钥路径、Windows CI、桌面测试及本报告需提交到 desktop-release</div>
+        <div class="item-title">Windows 10 / 11 无环境实机验收</div>
+        <div class="item-desc">在未安装 Python 的有交互桌面机器上验证解压、双击、WebView2 窗口、重启和单实例行为</div>
       </div>
     </li>
   </ul>
@@ -700,6 +709,36 @@
         </tr>
       </thead>
       <tbody>
+        <tr>
+          <td><code>c5d8d37</code></td>
+          <td>ci</td>
+          <td>升级 Windows 构建所用官方 Actions 至 Node.js 24 运行时</td>
+        </tr>
+        <tr>
+          <td><code>7e7b684</code></td>
+          <td>test</td>
+          <td>隔离打包后端冒烟：server-only、动态端口、真实健康端点</td>
+        </tr>
+        <tr>
+          <td><code>bdedc4c</code></td>
+          <td>fix</td>
+          <td>Windows 冒烟请求绕过 runner 代理</td>
+        </tr>
+        <tr>
+          <td><code>1ed2075</code></td>
+          <td>test</td>
+          <td>增强 Windows 启动冒烟诊断与日志输出</td>
+        </tr>
+        <tr>
+          <td><code>505a120</code></td>
+          <td>fix</td>
+          <td>修复 Windows cp1252 控制台无法输出中文构建状态</td>
+        </tr>
+        <tr>
+          <td><code>829db45</code></td>
+          <td>fix</td>
+          <td>加固桌面打包、签名、密钥路径、测试和 Windows CI</td>
+        </tr>
         <tr>
           <td><code>235ce4d</code></td>
           <td>feat</td>
@@ -745,52 +784,47 @@
   </div>
 </section>
 
-<!-- 未提交变更 -->
+<!-- 远程同步状态 -->
 <section>
-  <h2>当前未提交变更</h2>
-  <div class="callout callout-warning">
-    <div class="callout-title">本轮 7 个文件待提交</div>
-    <p>以下文件包含本轮发布门禁修复、Windows 自动验证流程和进度证据：</p>
+  <h2>远程同步与验证状态</h2>
+  <div class="callout">
+    <div class="callout-title">desktop-release 已同步，代码工作区无待提交变更</div>
+    <p>本轮发布门禁修复和 Windows 自动验证流程已推送；本报告随同最终文档提交。</p>
   </div>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>文件</th>
-          <th>变更行数</th>
-          <th>变更内容</th>
+          <th>范围</th>
+          <th>状态</th>
+          <th>证据</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td><code>desktop.py</code></td>
-          <td>修改</td>
-          <td>密钥与数据库同目录、密钥盐迁移、Windows 独占单实例锁、窗口状态容错</td>
+          <td>本地回归</td>
+          <td>通过</td>
+          <td>54 / 54：核心 45 + 桌面端 9</td>
         </tr>
         <tr>
-          <td><code>build_scripts/build_desktop.py</code></td>
-          <td>修改</td>
-          <td>保留 framework 符号链接、严格签名门禁、Windows 产物结构检查</td>
+          <td>macOS 独立应用</td>
+          <td>通过</td>
+          <td>84.6MB；deep + strict 验签；启动健康检查 200；启动后签名有效</td>
         </tr>
         <tr>
-          <td><code>requirements-desktop.txt</code></td>
-          <td>修改</td>
-          <td>补齐并约束 PyInstaller、Pillow、pywebview 构建依赖</td>
+          <td>Windows CI #6</td>
+          <td>通过</td>
+          <td>run 30358546418；build-and-smoke-test 51 秒；无 annotations</td>
         </tr>
         <tr>
-          <td><code>test_all.py</code>、<code>tests/test_desktop.py</code></td>
-          <td>修改 + 新增</td>
-          <td>桌面端 7 项回归测试纳入核心测试入口</td>
+          <td>Windows artifact</td>
+          <td>已归档</td>
+          <td>wechat-ai-studio-windows；21.8MB；artifact 8687816900；2026-08-11 到期</td>
         </tr>
         <tr>
-          <td><code>.github/workflows/windows-desktop-build.yml</code></td>
-          <td>新增</td>
-          <td>Windows 2022 构建、产物检查、健康检查、SHA256 和 artifact 上传</td>
-        </tr>
-        <tr>
-          <td><code>work-progress-report/work-progress-report.html</code></td>
-          <td>新增</td>
-          <td>同步阶段八真实验证结果与剩余外部环境门禁</td>
+          <td>远程分支</td>
+          <td>已推送</td>
+          <td><code>desktop-release</code>，功能 / CI 基线 <code>c5d8d37</code></td>
         </tr>
       </tbody>
     </table>
@@ -899,11 +933,11 @@ python build_scripts\build_desktop.py --windows --clean
 <!-- 总结 -->
 <section>
   <h2>总结</h2>
-  <p>从 2.1.3 审计修复源码出发，当前推进到<strong>阶段八</strong>。macOS .app 已完成干净重建，体积从错误解引用符号链接时的 152.8MB 降至 84.6MB；严格签名验证、双击启动模拟和健康检查 200 均已通过，且启动后 bundle 签名保持有效。</p>
+  <p>从 2.1.3 审计修复源码出发，阶段八“Windows 打包与自动验证”已经完成，当前进入<strong>阶段九：Windows 实机交互验收</strong>。macOS .app 已完成干净重建，体积从错误解引用符号链接时的 152.8MB 降至 84.6MB；严格签名验证、双击启动模拟和健康检查 200 均已通过，且启动后 bundle 签名保持有效。</p>
 
-  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，双击 .app 即可启动</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 7 项桌面端回归测试全部通过。</p>
+  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，macOS 可双击 .app 启动，Windows 已生成完整 .exe 目录 artifact</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 9 项桌面端回归测试全部通过。Windows 2022 CI #6 的构建、单元测试、打包后端健康检查和 artifact 上传全部成功。</p>
 
-  <p>剩余工作：提交并推送本轮变更，运行 Windows 2022 CI / Windows 10/11 实机验证 .exe，在无 Python 环境机器做最终双击验证并归档证据。</p>
+  <p>唯一剩余外部门禁：在 Windows 10 / 11 有交互桌面、未安装 Python 的实机上解压 artifact，完成 WebView2 窗口、首次启动、关闭重启和单实例行为验收。GitHub Hosted Runner 无法替代这项人工 GUI 验收。</p>
 </section>
 
 </div>
