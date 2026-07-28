@@ -84,6 +84,7 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertIn("$response.ok -eq $true", workflow)
         self.assertIn("if ($process.HasExited)", workflow)
         self.assertIn("http://127.0.0.1:5001/api/v2/health", workflow)
+        self.assertIn("-NoProxy", workflow)
         self.assertNotIn("foreach ($port in 5001..5020)", workflow)
 
     def test_build_console_replaces_unencodable_status_characters(self):
