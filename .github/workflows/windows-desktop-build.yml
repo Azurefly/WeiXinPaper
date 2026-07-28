@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: "1"
+
 jobs:
   build-and-smoke-test:
     runs-on: windows-2022

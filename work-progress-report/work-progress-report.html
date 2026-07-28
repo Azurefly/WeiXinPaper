@@ -370,7 +370,7 @@
       <div class="label">macOS .app 体积</div>
     </div>
     <div class="status-card">
-      <div class="num success">51</div>
+      <div class="num success">52</div>
       <div class="label">核心 + 桌面端测试通过</div>
     </div>
     <div class="status-card">
@@ -568,8 +568,9 @@
           <li>已修复 master key 路径落入 .app bundle、造成健康检查 500 和签名失效</li>
           <li>macOS 干净重建 84.6MB，codesign deep + strict 通过，启动后签名仍有效</li>
           <li>双击启动模拟通过，health check 返回 200</li>
-          <li>新增 6 项桌面端回归测试，当前核心 45 + 桌面端 6 项全部通过</li>
+          <li>新增 7 项桌面端回归测试，当前核心 45 + 桌面端 7 项全部通过</li>
           <li>新增 Windows 2022 CI：构建 .exe、检查 _internal、启动后轮询健康端点</li>
+          <li>Windows CI #1 已运行：依赖与测试通过；定位并修复 cp1252 控制台编码崩溃</li>
           <li>待在 Windows CI / Windows 10/11 机器实际运行工作流并保存产物证据</li>
           <li>在无 Python 环境的机器上验证双击启动</li>
           <li>提交本轮修复并推送 desktop-release 分支</li>
@@ -777,7 +778,7 @@
         <tr>
           <td><code>test_all.py</code>、<code>tests/test_desktop.py</code></td>
           <td>修改 + 新增</td>
-          <td>桌面端 6 项回归测试纳入核心测试入口</td>
+          <td>桌面端 7 项回归测试纳入核心测试入口</td>
         </tr>
         <tr>
           <td><code>.github/workflows/windows-desktop-build.yml</code></td>
@@ -898,7 +899,7 @@ python build_scripts\build_desktop.py --windows --clean
   <h2>总结</h2>
   <p>从 2.1.3 审计修复源码出发，当前推进到<strong>阶段八</strong>。macOS .app 已完成干净重建，体积从错误解引用符号链接时的 152.8MB 降至 84.6MB；严格签名验证、双击启动模拟和健康检查 200 均已通过，且启动后 bundle 签名保持有效。</p>
 
-  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，双击 .app 即可启动</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 6 项桌面端回归测试全部通过。</p>
+  <p>核心成果：<strong>用户无需安装 Python 或任何依赖，双击 .app 即可启动</strong>。数据库、主密钥和密钥盐保持在同一 OS 标准数据目录，不再写入应用 bundle；当前 45 项核心自动化和 7 项桌面端回归测试全部通过。</p>
 
   <p>剩余工作：提交并推送本轮变更，运行 Windows 2022 CI / Windows 10/11 实机验证 .exe，在无 Python 环境机器做最终双击验证并归档证据。</p>
 </section>

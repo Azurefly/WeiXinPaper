@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import desktop
+from build_scripts import build_desktop
 
 
 class DesktopReleaseTests(unittest.TestCase):
@@ -69,6 +70,7 @@ class DesktopReleaseTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("copytree(app_bundle, root_app, symlinks=True)", source)
         self.assertIn('"--deep", "--strict"', source)
+        self.assertIn('reconfigure(errors="replace")', source)
         self.assertNotIn("签名验证有警告（不影响运行", source)
 
     def test_windows_workflow_checks_actual_health_contract(self):
@@ -78,7 +80,19 @@ class DesktopReleaseTests(unittest.TestCase):
             / "workflows"
             / "windows-desktop-build.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn('PYTHONUTF8: "1"', workflow)
         self.assertIn("$response.ok -eq $true", workflow)
+
+    def test_build_console_replaces_unencodable_status_characters(self):
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+        with (
+            mock.patch.object(build_desktop.sys, "stdout", stdout),
+            mock.patch.object(build_desktop.sys, "stderr", stderr),
+        ):
+            build_desktop.configure_console()
+        stdout.reconfigure.assert_called_once_with(errors="replace")
+        stderr.reconfigure.assert_called_once_with(errors="replace")
 
 
 if __name__ == "__main__":

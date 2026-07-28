@@ -30,6 +30,17 @@ DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build"
 
 
+def configure_console() -> None:
+    """避免 Windows 非 UTF-8 控制台因中文/状态符号导致构建直接崩溃。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 # ---------------------------------------------------------------------------
 # 前置检查
 # ---------------------------------------------------------------------------
@@ -310,6 +321,7 @@ def build_windows(clean: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    configure_console()
     args = sys.argv[1:]
     target = "auto"
     clean = False
