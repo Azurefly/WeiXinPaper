@@ -73,6 +73,8 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertIn("copytree(app_bundle, root_app, symlinks=True)", source)
         self.assertIn('"--deep", "--strict"', source)
         self.assertIn("urllib.request.ProxyHandler({})", source)
+        self.assertIn('"STUDIO_STARTUP_TRACE_FILE"', source)
+        self.assertIn("def diagnostics()", source)
         self.assertIn('reconfigure(errors="replace")', source)
         self.assertNotIn("签名验证有警告（不影响运行", source)
         spec = (
@@ -166,6 +168,7 @@ class DesktopReleaseTests(unittest.TestCase):
             "lock_sock = None if server_only else acquire_single_instance_lock()",
             source,
         )
+        self.assertIn('_trace_startup("server-serving")', source)
 
     def test_build_console_replaces_unencodable_status_characters(self):
         stdout = mock.Mock()

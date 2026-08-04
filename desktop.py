@@ -94,6 +94,20 @@ ERROR_HTML_TEMPLATE = """\
 """
 
 
+def _trace_startup(message: str) -> None:
+    """仅在显式配置时写入无界面启动轨迹，供打包验收诊断。"""
+    configured = os.environ.get("STUDIO_STARTUP_TRACE_FILE", "").strip()
+    if not configured:
+        return
+    try:
+        path = Path(configured)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{message}\n")
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # OS 标准路径
 # ---------------------------------------------------------------------------
@@ -513,9 +527,11 @@ def shutdown_server(server: object) -> None:
 def main() -> None:
     debug = "--debug" in sys.argv
     server_only = "--server-only" in sys.argv
+    _trace_startup("main-entered")
 
     # 1. 配置环境（数据/日志目录 + 迁移）
     data_dir = configure_environment()
+    _trace_startup("environment-configured")
 
     # 2. 单实例检查。server-only 是由构建/诊断程序管理的无界面
     # 进程，已通过 STUDIO_PORT 独占随机端口；若再绑定固定桌面锁
@@ -529,8 +545,11 @@ def main() -> None:
     try:
         port = select_server_port(server_only)
     except RuntimeError as exc:
-        show_error(APP_TITLE, str(exc))
+        _trace_startup(f"port-selection-failed: {exc}")
+        if not server_only:
+            show_error(APP_TITLE, str(exc))
         sys.exit(1)
+    _trace_startup(f"port-selected: {port}")
 
     host = "127.0.0.1"
     url = f"http://{host}:{port}/"
@@ -539,18 +558,23 @@ def main() -> None:
     # 4. 初始化后端服务器
     from runtime_security import validate_runtime_security
     from server import VERSION, create_server
+    _trace_startup("backend-imported")
 
     validate_runtime_security(host)
 
     try:
         server = create_server(host, port)
     except Exception as exc:  # noqa: BLE001
-        show_error(APP_TITLE, f"服务器初始化失败：\n{exc}")
+        _trace_startup(f"server-create-failed: {type(exc).__name__}: {exc}")
+        if not server_only:
+            show_error(APP_TITLE, f"服务器初始化失败：\n{exc}")
         sys.exit(1)
+    _trace_startup("server-created")
 
     # CI/支持诊断模式：运行与桌面端完全相同的打包后端，但不初始化 GUI。
     # GitHub Hosted Runner 没有可交互桌面，不适合作为 WebView2 窗口验收环境。
     if server_only:
+        _trace_startup("server-serving")
         print(f"{APP_TITLE} {VERSION} server-only → {url}")
         try:
             server.serve_forever(poll_interval=0.2)

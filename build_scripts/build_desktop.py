@@ -131,13 +131,24 @@ def smoke_test_packaged(executable: Path) -> None:
         port = int(probe.getsockname()[1])
     with tempfile.TemporaryDirectory(prefix="studio-desktop-smoke-") as temp:
         temp_root = Path(temp)
+        startup_trace = temp_root / "startup-trace.log"
+        studio_log = temp_root / "studio.log"
+
+        def diagnostics() -> str:
+            sections = []
+            for label, path in (("启动轨迹", startup_trace), ("应用日志", studio_log)):
+                if path.is_file():
+                    sections.append(f"[{label}]\n{path.read_text(encoding='utf-8', errors='replace')[-4000:]}")
+            return "\n".join(sections)
+
         env = os.environ.copy()
         env.update(
             {
                 "STUDIO_DB": str(temp_root / "studio.db"),
                 "STUDIO_MASTER_KEY_FILE": str(temp_root / ".master.key"),
-                "STUDIO_LOG_FILE": str(temp_root / "studio.log"),
+                "STUDIO_LOG_FILE": str(studio_log),
                 "STUDIO_PORT": str(port),
+                "STUDIO_STARTUP_TRACE_FILE": str(startup_trace),
             }
         )
         process = subprocess.Popen(
@@ -153,7 +164,9 @@ def smoke_test_packaged(executable: Path) -> None:
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     output = process.stdout.read() if process.stdout else ""
-                    raise RuntimeError(f"打包产物提前退出：\n{output[-4000:]}")
+                    raise RuntimeError(
+                        f"打包产物提前退出：\n{output[-4000:]}\n{diagnostics()}"
+                    )
                 try:
                     with local_http.open(
                         f"http://127.0.0.1:{port}/api/v2/health", timeout=2
@@ -165,7 +178,9 @@ def smoke_test_packaged(executable: Path) -> None:
                 except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
                     time.sleep(0.25)
             output = process.stdout.read() if process.poll() is not None and process.stdout else ""
-            raise RuntimeError(f"打包产物未在 30 秒内就绪：\n{output[-4000:]}")
+            raise RuntimeError(
+                f"打包产物未在 30 秒内就绪：\n{output[-4000:]}\n{diagnostics()}"
+            )
         finally:
             process.terminate()
             try:
