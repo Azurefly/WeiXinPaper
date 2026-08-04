@@ -28,6 +28,25 @@ datas = [
 
 # 隐式导入（PyInstaller 无法自动检测的模块）
 hiddenimports = [
+    # desktop.py 会在运行时把 backend/ 加入 sys.path，再动态 import server。
+    # PyInstaller 无法沿这条动态路径分析依赖，因此必须把后端入口全部纳入
+    # 模块图；只把 backend/ 当 datas 复制会漏掉 urllib.robotparser 等依赖。
+    "ai_engine",
+    "auth_password",
+    "auth_session",
+    "content_security",
+    "cover_generator",
+    "data_transfer",
+    "db",
+    "logger_config",
+    "runtime_security",
+    "secrets_store",
+    "secure_http",
+    "server",
+    "source_fetcher",
+    "test_mode",
+    "wechat_api",
+    "workflow",
     "webview",
     "webview.platforms.edgechromium",
     "webview.platforms.cocoa",
@@ -56,6 +75,7 @@ hiddenimports = [
     "urllib.parse",
     "urllib.request",
     "urllib.error",
+    "urllib.robotparser",
     "html.parser",
     "json",
     "uuid",
@@ -107,11 +127,13 @@ if sys.platform == "win32":
 
 a = Analysis(
     ["../desktop.py"],
-    pathex=["..", "../backend"],
+    pathex=[str(PROJECT_ROOT), str(PROJECT_ROOT / "backend")],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    # 优先使用项目 hook。本项目的 backend/workflow.py 与 PyPI 上的
+    # workflow 包同名，不覆盖第三方 hook 会错误查找不存在的包元数据。
+    hookspath=[str(PROJECT_ROOT / "build_scripts" / "hooks")],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[

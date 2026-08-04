@@ -16,10 +16,16 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -112,6 +118,60 @@ def ensure_icons() -> None:
     subprocess.check_call([sys.executable, str(gen_icon), str(BUILD_ASSETS)])
     print("✓ 图标生成完成")
     print()
+
+
+def smoke_test_packaged(executable: Path) -> None:
+    """启动打包后的真实后端，阻止“能生成文件但无法运行”的假成功。"""
+    print("=== 打包产物启动验证 ===")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    with tempfile.TemporaryDirectory(prefix="studio-desktop-smoke-") as temp:
+        temp_root = Path(temp)
+        env = os.environ.copy()
+        env.update(
+            {
+                "STUDIO_DB": str(temp_root / "studio.db"),
+                "STUDIO_MASTER_KEY_FILE": str(temp_root / ".master.key"),
+                "STUDIO_LOG_FILE": str(temp_root / "studio.log"),
+                "STUDIO_PORT": str(port),
+            }
+        )
+        process = subprocess.Popen(
+            [str(executable), "--server-only"],
+            cwd=str(executable.parent),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    output = process.stdout.read() if process.stdout else ""
+                    raise RuntimeError(f"打包产物提前退出：\n{output[-4000:]}")
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/v2/health", timeout=2
+                    ) as response:
+                        health = json.loads(response.read())
+                    if health.get("ok") is True:
+                        print("✓ 打包产物真实 HTTP 启动验证通过")
+                        return
+                except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+                    time.sleep(0.25)
+            output = process.stdout.read() if process.poll() is not None and process.stdout else ""
+            raise RuntimeError(f"打包产物未在 30 秒内就绪：\n{output[-4000:]}")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout:
+                process.stdout.close()
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +289,7 @@ def build_macos(clean: bool = False) -> None:
             stderr=result.stderr,
         )
     print("✓ 签名验证通过（deep + strict）")
+    smoke_test_packaged(exe)
 
     # 显示大小
     size = sum(f.stat().st_size for f in root_app.rglob("*") if f.is_file())
@@ -283,6 +344,7 @@ def build_windows(clean: bool = False) -> None:
     if not internal_dir.is_dir():
         print("✗ 构建失败：缺少 _internal 依赖目录", file=sys.stderr)
         sys.exit(1)
+    smoke_test_packaged(exe)
 
     # 创建快捷方式脚本
     shortcut_ps1 = win_dir / "创建桌面快捷方式.ps1"

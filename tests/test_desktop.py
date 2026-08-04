@@ -80,8 +80,21 @@ class DesktopReleaseTests(unittest.TestCase):
             / "desktop.spec"
         ).read_text(encoding="utf-8")
         self.assertIn("PROJECT_ROOT = Path(SPEC).resolve().parent.parent", spec)
+        self.assertIn('pathex=[str(PROJECT_ROOT), str(PROJECT_ROOT / "backend")]', spec)
+        self.assertIn('PROJECT_ROOT / "build_scripts" / "hooks"', spec)
         self.assertIn("icon=icon_path", spec)
+        self.assertIn('"server"', spec)
+        self.assertIn('"source_fetcher"', spec)
+        self.assertIn('"urllib.robotparser"', spec)
         self.assertNotIn("icon_path if Path(icon_path).exists() else None", spec)
+        hook = (
+            Path(__file__).resolve().parents[1]
+            / "build_scripts"
+            / "hooks"
+            / "hook-workflow.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("datas = []", hook)
+        self.assertIn("hiddenimports = []", hook)
 
     def test_custom_icon_source_has_safe_transparent_edges_and_multisize_ico(self):
         source_path = (

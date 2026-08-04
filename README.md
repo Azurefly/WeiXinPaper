@@ -2,13 +2,25 @@
 
 一个本地优先的微信公众号内容工作台：从网页来源或创作主题出发，完成 AI 写作、审校、人工终审和微信草稿同步。
 
+## 下载桌面版
+
+前往 [GitHub Releases](https://github.com/Azurefly/WeiXinPaper/releases/latest) 下载对应平台的独立安装包，无需预装 Python：
+
+| 平台 | 文件 | 使用方式 |
+| --- | --- | --- |
+| macOS Apple Silicon | `WeiXinGZH-AI-Studio-2.1.3-macOS-arm64.zip` | 解压后将 App 拖入「应用程序」，首次启动右键选择「打开」 |
+| macOS Intel | `WeiXinGZH-AI-Studio-2.1.3-macOS-x86_64.zip` | 解压后将 App 拖入「应用程序」，首次启动右键选择「打开」 |
+| Windows 10/11 x64 | `WeiXinGZH-AI-Studio-2.1.3-Windows-x64.zip` | 解压完整目录，双击 `公众号 AI Studio.exe` |
+
+macOS 包采用 ad-hoc 签名，已通过 `codesign --deep --strict` 校验，但未使用 Apple Developer ID 公证。Windows 包包含完整运行时和图标，不要只复制 `.exe`，必须保留 `_internal` 目录。可用 Release 中的 `SHA256SUMS.txt` 校验下载文件。
+
 ## 产品边界
 
 - 「强制引用模式」要求可核验的网页来源与 `[来源N]` 标记；它不等同于第三方事实核查。
 - 「来源文本重合」只比较当前抓取的来源；它不会声称全网原创度。
 - 发布操作创建公众号草稿，不会直接群发。发布页会明确显示目标账号、AppID 后缀和 revision。
 
-## 快速开始
+## 源码运行
 
 要求 Python 3.11+，核心运行无第三方 Python 依赖。
 
@@ -25,6 +37,15 @@ start_windows.cmd
 ```
 
 然后访问 `http://127.0.0.1:5000/`。首次启动会在数据目录生成 `.initial_password`，登录后必须立即改密。
+
+## 构建桌面版
+
+```bash
+python3 -m pip install -r requirements-desktop.txt
+python3 build_scripts/build_desktop.py --clean
+```
+
+构建必须在目标操作系统执行：macOS 生成 `公众号 AI Studio.app`，Windows 生成 `dist/公众号 AI Studio/`。GitHub Actions 的桌面构建工作流会分别执行单元测试、打包、真实本地 HTTP 冒烟测试和附件归档。
 
 ## 工作流
 
