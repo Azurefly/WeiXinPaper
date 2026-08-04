@@ -72,6 +72,7 @@ class DesktopReleaseTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("copytree(app_bundle, root_app, symlinks=True)", source)
         self.assertIn('"--deep", "--strict"', source)
+        self.assertIn("urllib.request.ProxyHandler({})", source)
         self.assertIn('reconfigure(errors="replace")', source)
         self.assertNotIn("签名验证有警告（不影响运行", source)
         spec = (

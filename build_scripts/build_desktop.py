@@ -123,6 +123,9 @@ def ensure_icons() -> None:
 def smoke_test_packaged(executable: Path) -> None:
     """启动打包后的真实后端，阻止“能生成文件但无法运行”的假成功。"""
     print("=== 打包产物启动验证 ===")
+    # GitHub Hosted Runner 可能注入 HTTP(S)_PROXY。回环健康检查必须
+    # 明确绕过代理，否则会把正常运行的本地进程误判为启动超时。
+    local_http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
@@ -152,7 +155,7 @@ def smoke_test_packaged(executable: Path) -> None:
                     output = process.stdout.read() if process.stdout else ""
                     raise RuntimeError(f"打包产物提前退出：\n{output[-4000:]}")
                 try:
-                    with urllib.request.urlopen(
+                    with local_http.open(
                         f"http://127.0.0.1:{port}/api/v2/health", timeout=2
                     ) as response:
                         health = json.loads(response.read())
