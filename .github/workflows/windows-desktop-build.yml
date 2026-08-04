@@ -202,7 +202,7 @@ jobs:
           $asset = "WeiXinGZH-AI-Studio-$env:APP_VERSION-Windows-x64.zip"
           Compress-Archive -Path "dist\公众号 AI Studio\*" -DestinationPath $asset -CompressionLevel Optimal
           (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower() + "  " + $asset |
-            Out-File -Encoding ascii "$asset.sha256"
+            Out-File -Encoding ascii -NoNewline "$asset.sha256"
 
       - name: Upload Windows package
         uses: actions/upload-artifact@v7

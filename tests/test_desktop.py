@@ -147,6 +147,7 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:$port/api/v2/health", workflow)
         self.assertIn("TcpListener", workflow)
         self.assertIn("-NoProxy", workflow)
+        self.assertIn('Out-File -Encoding ascii -NoNewline "$asset.sha256"', workflow)
         self.assertNotIn("foreach ($port in 5001..5020)", workflow)
 
     def test_server_only_mode_requires_and_reserves_exact_port(self):
