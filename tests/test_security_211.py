@@ -5,6 +5,20 @@ from pathlib import Path
 from tests.test_release import running_server
 
 class Security211Tests(unittest.TestCase):
+    def test_https_public_origin_enables_secure_cookie(self):
+        from auth_session import build_cookie, build_clear_cookie
+
+        previous = os.environ.get('STUDIO_PUBLIC_ORIGIN')
+        os.environ['STUDIO_PUBLIC_ORIGIN'] = 'https://studio.example.com'
+        try:
+            self.assertIn('; Secure', build_cookie('token'))
+            self.assertIn('; Secure', build_clear_cookie())
+        finally:
+            if previous is None:
+                os.environ.pop('STUDIO_PUBLIC_ORIGIN', None)
+            else:
+                os.environ['STUDIO_PUBLIC_ORIGIN'] = previous
+
     def test_dns_rebinding_is_blocked(self):
         with running_server() as (client, db, base):
             req=urllib.request.Request(base+'/api/v2/workflows',data=b'{"sourceInput":"x"}',method='POST',headers={'Content-Type':'application/json','Host':'evil.example','Origin':'http://evil.example'})
@@ -40,7 +54,7 @@ class Security211Tests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn:
                 version=conn.execute('select version from schema_meta').fetchone()[0]
                 raw=conn.execute("select value_json from settings where key='ai'").fetchone()[0]
-            self.assertEqual(version,212); self.assertNotIn('plaintext',raw); self.assertIn('enc:v1:',raw); self.assertTrue(list(path.parent.glob(path.name+'.pre-2.1.2-v0-*.bak')))
+            self.assertEqual(version,213); self.assertNotIn('plaintext',raw); self.assertIn('enc:v1:',raw); self.assertTrue(list(path.parent.glob(path.name+'.pre-2.1.2-v0-*.bak')))
         finally:
             if old is None: os.environ.pop('STUDIO_DB',None)
             else: os.environ['STUDIO_DB']=old

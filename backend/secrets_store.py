@@ -136,6 +136,13 @@ def _validate_posix_permissions(path: Path) -> None:
 def _key() -> bytes:
     raw_env = os.environ.get("STUDIO_MASTER_KEY", "").strip()
     if raw_env:
+        # P1-12: STUDIO_MASTER_KEY 无 salt 派生，安全性低于 STUDIO_MASTER_PASSWORD。
+        # 记录警告，建议用户改用 STUDIO_MASTER_PASSWORD（PBKDF2 + 随机 salt + 600k 迭代）。
+        import logging
+        logging.getLogger("secrets_store").warning(
+            "STUDIO_MASTER_KEY 使用无 salt 的 SHA256 派生，安全性较低。"
+            "建议改用 STUDIO_MASTER_PASSWORD 环境变量（PBKDF2-HMAC-SHA256 + 随机 salt + 600000 次迭代）。"
+        )
         return hashlib.sha256(raw_env.encode("utf-8")).digest()
 
     password = os.environ.get("STUDIO_MASTER_PASSWORD", "")

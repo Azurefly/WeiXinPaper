@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -16,23 +17,33 @@ from db import connect, get_project, get_setting, get_task, record_project_versi
 from logger_config import get_logger
 from source_fetcher import SourceFetchError, fetch_source
 
+def _env_int(name: str, default: int) -> int:
+    """P1-24: 安全读取环境变量为 int，转换失败时返回默认值。"""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 _MAX_WORKERS = max(2, min(6, (os.cpu_count() or 2)))
-_MAX_PENDING = max(_MAX_WORKERS, int(os.environ.get("STUDIO_WORKFLOW_QUEUE_LIMIT", "32")))
+_MAX_PENDING = max(_MAX_WORKERS, _env_int("STUDIO_WORKFLOW_QUEUE_LIMIT", 32))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="studio-workflow")
 _QUEUE_SLOTS = threading.BoundedSemaphore(_MAX_PENDING)
 _START_LOCK = threading.RLock()
-MAX_WORKFLOW_SECONDS = int(os.environ.get("STUDIO_WORKFLOW_TIMEOUT", "1200"))
+MAX_WORKFLOW_SECONDS = _env_int("STUDIO_WORKFLOW_TIMEOUT", 1200)
 # N3 分步超时：每个步骤独立超时阈值，避免单步耗时过长挤占其他步骤
 STEP_TIMEOUTS = {
-    "source": int(os.environ.get("STUDIO_TIMEOUT_SOURCE", "30")),
-    "research": int(os.environ.get("STUDIO_TIMEOUT_RESEARCH", "10")),
-    "outline": int(os.environ.get("STUDIO_TIMEOUT_OUTLINE", "120")),
-    "draft": int(os.environ.get("STUDIO_TIMEOUT_DRAFT", "120")),
-    "cover": int(os.environ.get("STUDIO_TIMEOUT_COVER", "30")),
-    "review": int(os.environ.get("STUDIO_TIMEOUT_REVIEW", "90")),
+    "source": _env_int("STUDIO_TIMEOUT_SOURCE", 30),
+    "research": _env_int("STUDIO_TIMEOUT_RESEARCH", 10),
+    "outline": _env_int("STUDIO_TIMEOUT_OUTLINE", 120),
+    "draft": _env_int("STUDIO_TIMEOUT_DRAFT", 120),
+    "cover": _env_int("STUDIO_TIMEOUT_COVER", 30),
+    "review": _env_int("STUDIO_TIMEOUT_REVIEW", 90),
 }
 _ACTIVE_STATUSES = {"queued", "running"}
 _RETRYABLE_STATUSES = {"failed", "blocked", "cancelled", "timeout"}
+# 重试范围：review_only 仅重做审校；preserve_body 保留正文与现有框架（仅重做封面/审校）；
+# from_outline 复用框架重做正文；full 框架与正文全部重做。
 _RETRY_MODES = {"review_only", "preserve_body", "from_outline", "full"}
 
 
@@ -91,6 +102,15 @@ def _task_update(task_id: str, **values: Any) -> None:
         conn.execute(sql, tuple(value for _, value in columns) + (task_id,))
 
 
+def _update_checkpoint(task_id: str, step: str) -> None:
+    """R1 修复：更新任务的检查点步骤，用于服务重启后恢复。"""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET checkpoint_step=?, updated_at=? WHERE id=?",
+            (step, utc_now(), task_id),
+        )
+
+
 def _guard(task_id: str, started_monotonic: float, *, step: str = "", step_started: float = 0.0) -> None:
     task = get_task(task_id)
     if not task:
@@ -119,12 +139,21 @@ def _skip(task_id: str, step: str, message: str) -> None:
 def _submit(task_id: str) -> None:
     if not _QUEUE_SLOTS.acquire(blocking=False):
         raise WorkflowQueueFull(f"工作流队列已满（上限 {_MAX_PENDING}），请稍后重试")
+    # P1-16: 用 try/finally 守护槽位释放，避免 future 在 submit 与 add_done_callback
+    # 之间被取消时槽位泄漏。
+    callback_registered = False
     try:
         future = _EXECUTOR.submit(_run_workflow, task_id)
-    except Exception:
-        _QUEUE_SLOTS.release()
-        raise
-    future.add_done_callback(lambda _future: _QUEUE_SLOTS.release())
+        future.add_done_callback(lambda _future: _QUEUE_SLOTS.release())
+        callback_registered = True
+    finally:
+        if not callback_registered:
+            _QUEUE_SLOTS.release()
+
+
+def shutdown_executor() -> None:
+    """优雅关闭工作流线程池（服务关闭时由 server 调用）。"""
+    _EXECUTOR.shutdown(wait=True, cancel_futures=True)
 
 
 def _active_task_for_project(conn: Any, project_id: str) -> Any:
@@ -196,6 +225,36 @@ def _source_text(project_id: str) -> str:
         )
         parts.append(f"[来源{index}] {meta}\n{row['content_text']}")
     return "\n\n---\n\n".join(parts)
+
+
+def _source_snapshot_age_hours(project_id: str) -> float | None:
+    """R2 修复：查询项目来源快照的年龄（小时）。
+
+    返回最近一次来源快照的 fetched_at 距今的小时数。
+    如果项目没有来源快照，返回 None。
+    """
+    from datetime import datetime, timezone
+
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MAX(s.fetched_at) AS latest
+            FROM project_sources ps
+            JOIN source_snapshots s ON s.id = ps.snapshot_id
+            WHERE ps.project_id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+    if not row or not row["latest"]:
+        return None
+    try:
+        fetched = datetime.fromisoformat(row["latest"].replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    return (now_utc - fetched).total_seconds() / 3600.0
 
 
 def _strict_evidence_gate(project: dict[str, Any], source_text: str, strict_facts: bool) -> None:
@@ -290,21 +349,28 @@ def retry_workflow(task_id: str, retry_mode: str = "review_only") -> dict[str, A
         raise KeyError("任务不存在")
     if original["status"] not in _RETRYABLE_STATUSES:
         raise ValueError("仅失败、阻断、取消或超时的任务可以重试")
-    project = get_project(original["projectId"], include_deleted=True)
-    if not project or project["deleted"]:
-        raise ValueError("原文章已删除，无法重试")
-    if retry_mode in {"review_only", "from_outline"} and not project["bodyMarkdown"] and retry_mode == "review_only":
-        raise ValueError("当前文章没有正文，不能只重做审校")
-    if retry_mode == "from_outline" and not project["outline"]:
-        raise ValueError("当前文章没有可复用框架，不能从框架重做")
 
     now = utc_now()
     new_task_id = _id("tsk")
     with _START_LOCK, connect() as conn:
+        # P1-14: 将文章读取移入 _START_LOCK 事务，并对状态更新加 revision 校验，
+        # 防止覆盖并发的人工编辑。
+        project = get_project(original["projectId"], include_deleted=True)
+        if not project or project["deleted"]:
+            raise ValueError("原文章已删除，无法重试")
+        if retry_mode in {"review_only", "from_outline"} and not project["bodyMarkdown"] and retry_mode == "review_only":
+            raise ValueError("当前文章没有正文，不能只重做审校")
+        if retry_mode == "from_outline" and not project["outline"]:
+            raise ValueError("当前文章没有可复用框架，不能从框架重做")
         active = _active_task_for_project(conn, project["id"])
         if active:
             raise ValueError(f"该文章已有活跃任务 {active['id']}，不能并发重试")
-        conn.execute("UPDATE projects SET status='working', updated_at=? WHERE id=?", (now, project["id"]))
+        cursor = conn.execute(
+            "UPDATE projects SET status='working', updated_at=? WHERE id=? AND revision=?",
+            (now, project["id"], project["revision"]),
+        )
+        if cursor.rowcount != 1:
+            raise WorkflowConflict("文章版本已变化，无法开始重试任务")
         conn.execute(
             """
             INSERT INTO tasks(
@@ -362,13 +428,32 @@ def cancel_workflow(task_id: str) -> dict[str, Any]:
 def mark_interrupted_tasks() -> None:
     now = utc_now()
     with connect() as conn:
-        rows = conn.execute("SELECT id, project_id FROM tasks WHERE status IN ('queued', 'running')").fetchall()
-        for row in rows:
+        rows = conn.execute(
+            "SELECT id, project_id, retry_mode, base_revision FROM tasks WHERE status IN ('queued', 'running')"
+        ).fetchall()
+    for row in rows:
+        retry_mode = str(row["retry_mode"] or "full")
+        base_revision = int(row["base_revision"] or 0)
+        # P1-13: full 重试的任务先回滚到启动前快照，避免停留在半完成状态
+        if retry_mode == "full" and base_revision > 0:
+            _rollback_to_base_revision(row["project_id"], base_revision)
+        with connect() as conn:
             conn.execute(
                 "UPDATE tasks SET status='failed', error_code='server_restarted', error_detail='服务重启导致任务中断', message='任务因服务重启中断', finished_at=?, updated_at=? WHERE id=?",
                 (now, now, row["id"]),
             )
             conn.execute("UPDATE projects SET status='draft', updated_at=? WHERE id=?", (now, row["project_id"]))
+        # P1-13: 记录中断事件，便于排查
+        try:
+            _event(
+                row["id"],
+                "error",
+                "interrupted",
+                "任务因服务重启中断",
+                {"code": "server_restarted"},
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _load_plan(project: dict[str, Any]) -> dict[str, Any]:
@@ -376,6 +461,99 @@ def _load_plan(project: dict[str, Any]) -> dict[str, Any]:
         "title": project["title"],
         "summary": project["summary"],
         "outline": project["outline"],
+    }
+
+
+def _check_image_alt_text(body_markdown: str) -> dict[str, Any]:
+    """#127 图片 alt 文本检测：检查正文中的图片是否缺少 alt 描述文本。
+
+    解析 Markdown 图片语法 ![alt](url)，标记 alt 为空的图片，
+    影响无障碍访问与 SEO。
+    """
+    img_pattern = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+    matches = img_pattern.findall(body_markdown)
+    if not matches:
+        return {
+            "id": "image_alt_text",
+            "label": "图片替代文本",
+            "status": "passed",
+            "message": "正文中未检测到图片",
+        }
+    missing: list[dict[str, str]] = []
+    for alt, src in matches:
+        if not alt.strip():
+            missing.append({"src": src[:120], "alt": ""})
+    if not missing:
+        return {
+            "id": "image_alt_text",
+            "label": "图片替代文本",
+            "status": "passed",
+            "message": f"已检查 {len(matches)} 张图片，全部具备 alt 描述",
+        }
+    return {
+        "id": "image_alt_text",
+        "label": "图片替代文本",
+        "status": "warning",
+        "message": f"检测到 {len(missing)}/{len(matches)} 张图片缺少 alt 描述文本，影响无障碍访问与 SEO",
+        "detail": missing,
+    }
+
+
+def _check_external_links(body_markdown: str) -> dict[str, Any]:
+    """#128 外链可访问性检测：检查正文中的外部链接 HTTP 状态码。
+
+    仅检查 http/https 链接，使用 secure_http 发起 GET 请求。
+    为避免耗时过长，最多检查 5 个链接，每个超时 8 秒。
+    返回审校项。
+    """
+    from secure_http import SecureHttpError, request_bytes
+
+    link_pattern = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+    matches = link_pattern.findall(body_markdown)
+    urls = [url for _, url in matches]
+    if not urls:
+        return {
+            "id": "external_links",
+            "label": "外链可访问性",
+            "status": "passed",
+            "message": "正文中未检测到外部链接",
+        }
+    urls = urls[:5]
+    results: list[dict[str, Any]] = []
+    failed_count = 0
+    for url in urls:
+        try:
+            response = request_bytes(
+                url, method="GET", timeout=8, max_bytes=10_000,
+                require_https=False, reject_redirects=False,
+            )
+            status_code = response.status
+            if status_code < 400:
+                results.append({"url": url, "status": status_code, "ok": True})
+            else:
+                results.append({"url": url, "status": status_code, "ok": False})
+                failed_count += 1
+        except SecureHttpError as exc:
+            results.append({"url": url, "status": 0, "ok": False, "error": exc.code})
+            failed_count += 1
+        except Exception:  # noqa: BLE001
+            results.append({"url": url, "status": 0, "ok": False, "error": "unknown"})
+            failed_count += 1
+    if failed_count == 0:
+        status = "passed"
+        message = f"已检查 {len(urls)} 个外链，全部可访问"
+    elif failed_count < len(urls):
+        status = "warning"
+        message = f"已检查 {len(urls)} 个外链，{failed_count} 个不可访问，请核实"
+    else:
+        status = "failed"
+        message = f"已检查 {len(urls)} 个外链，全部不可访问"
+    return {
+        "id": "external_links",
+        "label": "外链可访问性",
+        "status": status,
+        "message": message,
+        "detail": results,
     }
 
 
@@ -406,23 +584,45 @@ def _run_workflow(task_id: str) -> None:
             source_text = _source_text(project_id)
             wlog.info("来源抓取完成: %s", project["sourceInput"][:80])
         elif project["sourceKind"] == "url":
-            _skip(task_id, "source", "已复用文章现有不可变来源快照")
-            wlog.info("复用已有来源快照")
+            # R2 修复：检查来源快照是否过期，超过 24 小时自动刷新
+            snapshot_age = _source_snapshot_age_hours(project_id)
+            if snapshot_age is not None and snapshot_age > 24:
+                wlog.info("来源快照已过期（%.1f 小时），重新抓取", snapshot_age)
+                _step(task_id, "source", 10, "来源快照已过期，正在重新安全读取")
+                try:
+                    source_title, _ = _snapshot_source(project_id, project["sourceInput"])
+                    source_text = _source_text(project_id)
+                    wlog.info("来源重新抓取完成: %s", project["sourceInput"][:80])
+                except Exception as exc:  # noqa: BLE001
+                    wlog.warning("来源重新抓取失败，使用旧快照: %s", exc)
+                    _skip(task_id, "source", "来源重新抓取失败，已复用旧来源快照")
+            else:
+                _skip(task_id, "source", "已复用文章现有不可变来源快照")
+                wlog.info("复用已有来源快照")
         else:
             _step(task_id, "research", 10, "正在理解创作目标")
             source_text = f"用户提供的创作主题与约束：\n{project['sourceInput']}"
             _skip(task_id, "source", "主题创作没有网页来源读取步骤")
             wlog.info("主题创作模式: %s", project["sourceInput"][:80])
         _guard(task_id, started)
+        _update_checkpoint(task_id, "research")
 
         general = get_setting("general")
         strict_facts = bool(general.get("strictFacts", False))
         _strict_evidence_gate(project, source_text, strict_facts)
         ai_config = get_setting("ai")
         engine = AIEngine(ai_config)
+        # #142 注册备用模型切换回调：在任务时间线记录切换事件，供前端展示
+        engine.on_backup_switch = lambda main, backup, reason: _event(
+            task_id, "warning", "outline",
+            f"主模型 {main} 连续失败（{reason}），已自动切换到备用模型 {backup}",
+            {"mainModel": main, "backupModel": backup, "reason": reason},
+        )
 
         plan = _load_plan(project)
-        if retry_mode in {"full", "preserve_body"}:
+        # P0-4: preserve_body 保留正文，也不应重新生成框架（否则框架与旧正文不匹配）；
+        # 仅 full 模式重新生成框架，其余模式复用现有框架。
+        if retry_mode == "full":
             _step(task_id, "outline", 35, "正在生成文章框架")
             plan = engine.plan(project["goal"], source_text, strict_facts, requirements=project.get("requirements") or "")
             wlog.info("文章框架生成完成: title=%s", (plan.get("title") or "")[:60])
@@ -441,6 +641,7 @@ def _run_workflow(task_id: str) -> None:
             )
         else:
             _skip(task_id, "outline", "按所选重试范围复用现有文章框架")
+        _update_checkpoint(task_id, "outline")
 
         body = project["bodyMarkdown"]
         if retry_mode in {"full", "from_outline"}:
@@ -479,15 +680,20 @@ def _run_workflow(task_id: str) -> None:
                 raise AIEngineError("body_required", "所选重试范围需要已有正文")
             fingerprint = hashlib.sha256(body.encode("utf-8")).hexdigest()
             _skip(task_id, "draft", "按所选重试范围保留人工正文")
+        _update_checkpoint(task_id, "draft")
 
         # 封面生成：如果用户未手动上传封面，则根据标题自动生成
-        existing_cover = project.get("coverDataUrl") or ""
+        # P1-19: 重新读取文章以获取最新 title/summary（from_outline 等模式下正文已重新生成，
+        # 框架/标题可能已更新），避免封面与最新框架不一致。
+        latest_project = get_project(project_id)
+        cover_project = latest_project or project
+        existing_cover = cover_project.get("coverDataUrl") or ""
         if not existing_cover.strip():
             _step(task_id, "cover", 72, "正在生成封面图片")
             try:
                 cover_url = generate_cover_data_url(
-                    plan.get("title") or project["title"],
-                    plan.get("summary") or "",
+                    cover_project.get("title") or project["title"],
+                    cover_project.get("summary") or "",
                 )
                 wlog.info("封面图片生成完成")
                 _guard(task_id, started)
@@ -498,9 +704,10 @@ def _run_workflow(task_id: str) -> None:
                     {"cover_data_url": cover_url},
                 )
             except Exception as exc:  # noqa: BLE001
-                _event(task_id, "warning", "cover", f"封面自动生成失败，可手动上传：{exc}", {})
+                _event(task_id, "warning", "cover", f"封面自动生成失败，可手动上传：{exc}", {"cover_failed": True})
         else:
             _skip(task_id, "cover", "已有手动封面，跳过自动生成")
+        _update_checkpoint(task_id, "cover")
 
         if task["autoReview"]:
             _step(task_id, "review", 82, "正在执行发布前审校")
@@ -523,10 +730,11 @@ def _run_workflow(task_id: str) -> None:
                         wlog.warning("获取内容安全检测 token 失败，跳过微信 API 检测")
 
                 security_checks = run_content_security_checks(
-                    body, source_text,
+                    body, source_text if project["sourceKind"] == "url" else "",
                     token=security_token,
                     app_id=wechat_app_id,
                     app_secret=wechat_secret,
+                    exclude_project_id=project_id,  # A2 修复：跨文章查重排除当前项目
                 )
                 checks.extend(security_checks)
                 wlog.info("内容安全检测完成: +%d 项检查", len(security_checks))
@@ -537,6 +745,30 @@ def _run_workflow(task_id: str) -> None:
                     "label": "内容安全检测",
                     "status": "warning",
                     "message": f"内容安全检测异常：{exc}",
+                })
+
+            # #127 图片 alt 文本检测
+            try:
+                alt_check = _check_image_alt_text(body)
+                checks.append(alt_check)
+                wlog.info("图片 alt 文本检测完成: %s", alt_check.get("message", ""))
+            except Exception as exc:  # noqa: BLE001
+                wlog.warning("图片 alt 文本检测异常: %s", exc)
+
+            # #128 外链可访问性检测（需要联网）
+            if bool(get_setting("general").get("allowNetwork", True)):
+                try:
+                    link_check = _check_external_links(body)
+                    checks.append(link_check)
+                    wlog.info("外链可访问性检测完成: %s", link_check.get("message", ""))
+                except Exception as exc:  # noqa: BLE001
+                    wlog.warning("外链可访问性检测异常: %s", exc)
+            else:
+                checks.append({
+                    "id": "external_links",
+                    "label": "外链可访问性",
+                    "status": "warning",
+                    "message": "联网能力已关闭，外链可访问性检测已跳过",
                 })
 
             _guard(task_id, started)
@@ -554,31 +786,42 @@ def _run_workflow(task_id: str) -> None:
             )
         else:
             _skip(task_id, "review", "已按设置跳过自动审校")
+        _update_checkpoint(task_id, "review")
 
         now = utc_now()
         with connect() as conn:
             conn.execute("UPDATE projects SET status='draft', updated_at=? WHERE id=?", (now, project_id))
             conn.execute(
-                "UPDATE tasks SET status='succeeded', current_step='completed', progress=100, message='文章已生成', finished_at=?, updated_at=? WHERE id=?",
+                "UPDATE tasks SET status='succeeded', current_step='completed', progress=100, message='文章已生成', checkpoint_step='completed', finished_at=?, updated_at=? WHERE id=?",
                 (now, now, task_id),
             )
         _event(task_id, "success", "completed", "统一工作流已完成", {"finalRevision": expected_revision})
         wlog.info("工作流完成: project=%s final_revision=%d", project_id, expected_revision)
     except AIConfigurationRequired as exc:
         wlog.warning("工作流阻塞: %s - %s", exc.code, exc)
-        _finish_error(task_id, project_id, "blocked", exc.code, str(exc), "warning", "blocked")
+        _finish_error(
+            task_id, project_id, "blocked", exc.code, str(exc), "warning", "blocked",
+            expected_revision=expected_revision,
+        )
     except WorkflowConflict as exc:
         wlog.warning("工作流冲突: %s", exc)
-        _finish_error(task_id, project_id, "blocked", "project_changed", str(exc), "warning", "blocked")
+        _finish_error(
+            task_id, project_id, "blocked", "project_changed", str(exc), "warning", "blocked",
+            expected_revision=expected_revision,
+        )
     except WorkflowCancelled as exc:
         wlog.info("工作流已取消: %s", exc)
-        _finish_error(task_id, project_id, "cancelled", "cancelled", str(exc), "warning", "cancelled")
+        _finish_error(
+            task_id, project_id, "cancelled", "cancelled", str(exc), "warning", "cancelled",
+            expected_revision=expected_revision,
+        )
     except WorkflowTimedOut as exc:
         wlog.error("工作流超时: %s", exc)
         _finish_error(
             task_id, project_id, "timeout", "workflow_timeout", str(exc), "error", "timeout",
             base_revision=int(task.get("baseRevision") or 0),
             retry_mode=retry_mode,
+            expected_revision=expected_revision,
         )
     except (SourceFetchError, AIEngineError) as exc:
         wlog.error("工作流失败: %s - %s", exc.code, exc, exc_info=exc)
@@ -586,6 +829,7 @@ def _run_workflow(task_id: str) -> None:
             task_id, project_id, "failed", exc.code, str(exc), "error", "failed",
             base_revision=int(task.get("baseRevision") or 0),
             retry_mode=retry_mode,
+            expected_revision=expected_revision,
         )
     except Exception as exc:  # noqa: BLE001
         wlog.error("工作流未预期错误: %s", exc, exc_info=exc)
@@ -600,6 +844,7 @@ def _run_workflow(task_id: str) -> None:
             {"detail": repr(exc)},
             base_revision=int(task.get("baseRevision") or 0),
             retry_mode=retry_mode,
+            expected_revision=expected_revision,
         )
 
 
@@ -627,51 +872,67 @@ _ROLLBACK_FIELDS: tuple[tuple[str, str], ...] = (
 _ROLLBACK_JSON_FIELDS = frozenset({"outline", "review"})
 
 
-def _rollback_to_base_revision(project_id: str, base_revision: int) -> None:
+def _rollback_to_base_revision(
+    project_id: str,
+    base_revision: int,
+    *,
+    conn: Any = None,
+) -> bool:
     """将文章尽力恢复到 base_revision 对应的版本快照。
 
     当 full 重试的工作流中途失败时调用，避免文章停留在半完成状态
     （例如框架已更新但正文未生成）。本函数是 best-effort：任何异常都会被
     记录并吞掉，以保证外层错误处理仍能向用户展示失败状态。
+
+    若传入 ``conn``，则在调用方事务内执行（不自行提交），用于将回滚纳入
+    单一事务；否则自行获取连接。返回 True 表示成功回滚，False 表示跳过或失败。
     """
     wlog = get_logger("workflow", project_id)
-    try:
-        with connect() as conn:
-            row = conn.execute(
-                "SELECT snapshot_json FROM project_versions "
-                "WHERE project_id=? AND revision=? ORDER BY id DESC LIMIT 1",
-                (project_id, base_revision),
-            ).fetchone()
-            if not row:
-                wlog.warning(
-                    "回滚跳过: 未找到 base_revision=%d 的版本快照，保留当前状态",
-                    base_revision,
-                )
-                return
-            snapshot = json.loads(row["snapshot_json"])
-            updates: dict[str, Any] = {}
-            for snapshot_key, column in _ROLLBACK_FIELDS:
-                if snapshot_key not in snapshot:
-                    continue
-                value = snapshot[snapshot_key]
-                if snapshot_key in _ROLLBACK_JSON_FIELDS:
-                    value = json.dumps(value, ensure_ascii=False)
-                elif isinstance(value, bool):
-                    value = 1 if value else 0
-                updates[column] = value
-            updates["revision"] = base_revision + 1
-            updates["status"] = "draft"
-            updates["updated_at"] = utc_now()
-            sql = "UPDATE projects SET " + ", ".join(f"{key}=?" for key in updates) + " WHERE id=?"
-            conn.execute(sql, tuple(updates.values()) + (project_id,))
-            wlog.info(
-                "已将文章回滚至 base_revision=%d 的快照（恢复 %d 个内容字段，新 revision=%d）",
+
+    def _do(c: Any) -> bool:
+        row = c.execute(
+            "SELECT snapshot_json FROM project_versions "
+            "WHERE project_id=? AND revision=? ORDER BY id DESC LIMIT 1",
+            (project_id, base_revision),
+        ).fetchone()
+        if not row:
+            wlog.warning(
+                "回滚跳过: 未找到 base_revision=%d 的版本快照，保留当前状态",
                 base_revision,
-                len(updates) - 3,
-                base_revision + 1,
             )
+            return False
+        snapshot = json.loads(row["snapshot_json"])
+        updates: dict[str, Any] = {}
+        for snapshot_key, column in _ROLLBACK_FIELDS:
+            if snapshot_key not in snapshot:
+                continue
+            value = snapshot[snapshot_key]
+            if snapshot_key in _ROLLBACK_JSON_FIELDS:
+                value = json.dumps(value, ensure_ascii=False)
+            elif isinstance(value, bool):
+                value = 1 if value else 0
+            updates[column] = value
+        updates["revision"] = base_revision + 1
+        updates["status"] = "draft"
+        updates["updated_at"] = utc_now()
+        sql = "UPDATE projects SET " + ", ".join(f"{key}=?" for key in updates) + " WHERE id=?"
+        c.execute(sql, tuple(updates.values()) + (project_id,))
+        wlog.info(
+            "已将文章回滚至 base_revision=%d 的快照（恢复 %d 个内容字段，新 revision=%d）",
+            base_revision,
+            len(updates) - 3,
+            base_revision + 1,
+        )
+        return True
+
+    try:
+        if conn is not None:
+            return _do(conn)
+        with connect() as c:
+            return _do(c)
     except Exception as exc:  # noqa: BLE001
         wlog.error("回滚失败: %s", exc, exc_info=exc)
+        return False
 
 
 def _finish_error(
@@ -686,26 +947,53 @@ def _finish_error(
     *,
     base_revision: int | None = None,
     retry_mode: str = "full",
+    expected_revision: int | None = None,
 ) -> None:
     now = utc_now()
-    _task_update(
-        task_id,
-        status=status,
-        message=message,
-        error_code=code,
-        error_detail=str((detail or {}).get("detail") or message),
-        finished_at=now,
-    )
-    # D1: full 重试的硬失败（failed/timeout）回滚到工作流启动前的快照，
-    # 避免文章停留在半完成状态。blocked/cancelled 保留当前状态供用户检查；
-    # review_only/preserve_body/from_outline 等部分重试也不回滚。
+    wlog = get_logger("workflow", task_id)
+    payload: dict[str, Any] = {"code": code, **(detail or {})}
     rolled_back = False
-    if status in {"failed", "timeout"} and retry_mode == "full" and base_revision is not None:
-        _rollback_to_base_revision(project_id, base_revision)
-        rolled_back = True
+    # P0-3: 将任务更新、回滚、项目状态收尾合并为单一事务，避免部分成功导致状态不一致。
     with connect() as conn:
-        conn.execute("UPDATE projects SET status='draft', updated_at=? WHERE id=?", (now, project_id))
-    payload = {"code": code, **(detail or {})}
+        # 1) 任务状态更新（内联 _task_update 的 SQL 以纳入同一事务）
+        conn.execute(
+            "UPDATE tasks SET status=?, message=?, error_code=?, error_detail=?, finished_at=?, updated_at=? WHERE id=?",
+            (status, message, code, str((detail or {}).get("detail") or message), now, now, task_id),
+        )
+        # 2) D1: full 重试的硬失败（failed/timeout）回滚到工作流启动前的快照，
+        #    避免文章停留在半完成状态。回滚复用同一事务（best-effort）。
+        #    blocked/cancelled 保留当前状态供用户检查；部分重试也不回滚。
+        if status in {"failed", "timeout"} and retry_mode == "full" and base_revision is not None:
+            rollback_ok = _rollback_to_base_revision(project_id, base_revision, conn=conn)
+            if rollback_ok:
+                rolled_back = True
+            else:
+                payload["rollback_failed"] = True
+        # 3) 项目状态收尾：置为 draft。若回滚已成功（已置 draft 并恢复内容）则跳过；
+        #    否则带 revision 校验更新，防止覆盖并发的人工编辑（P1-16）。
+        if not rolled_back:
+            check_revision = expected_revision
+            if check_revision is None:
+                proj_row = conn.execute(
+                    "SELECT revision FROM projects WHERE id=?", (project_id,)
+                ).fetchone()
+                check_revision = int(proj_row["revision"]) if proj_row else None
+            if check_revision is not None:
+                cursor = conn.execute(
+                    "UPDATE projects SET status='draft', updated_at=? WHERE id=? AND revision=?",
+                    (now, project_id, check_revision),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE projects SET status='draft', updated_at=? WHERE id=?",
+                    (now, project_id),
+                )
+            if cursor.rowcount != 1:
+                wlog.warning(
+                    "收尾项目状态更新未命中（revision 已变化，expected=%s），已跳过：project=%s",
+                    expected_revision,
+                    project_id,
+                )
     if rolled_back:
         payload["rolled_back_to"] = base_revision
     _event(task_id, level, step, message, payload)

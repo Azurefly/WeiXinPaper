@@ -9,8 +9,10 @@ import base64
 import hashlib
 import io
 import os
+import random
 import re
 import textwrap
+import time
 from typing import Sequence
 
 # 封面尺寸：900×383 像素（微信公众号推荐比例 2.35:1）
@@ -53,8 +55,15 @@ def _resolve_font(size: int):
 
 
 def _pick_palette(seed: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """根据字符串哈希选取一组渐变色板，使同一标题始终生成相同配色。"""
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    """根据字符串哈希选取一组渐变色板。
+
+    X5 修复：混入时间戳随机量，使同一标题在不同时间生成不同配色，
+    避免确定性指纹被用于识别系统生成的文章。
+    """
+    # 混入时间戳（精确到秒），同一标题每次生成封面时配色可能不同
+    time_component = str(int(time.time()))
+    combined = f"{seed}|{time_component}"
+    digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()
     index = int(digest[:8], 16) % len(_PALETTES)
     return _PALETTES[index]
 
@@ -123,7 +132,12 @@ def generate_cover_data_url(title: str, subtitle: str = "") -> str:
     _draw_gradient(draw, COVER_WIDTH, COVER_HEIGHT, start_color, end_color)
 
     # 装饰：左上角和右下角半透明圆
-    for offset, radius, alpha in [(0, 180, 30), (COVER_WIDTH - 160, 160, 25)]:
+    # X5 修复：引入随机偏移，避免确定性指纹
+    rand_offset_x = random.randint(-20, 20)
+    rand_offset_y = random.randint(-10, 10)
+    rand_alpha1 = random.randint(20, 40)
+    rand_alpha2 = random.randint(18, 32)
+    for offset, radius, alpha in [(rand_offset_x, 180, rand_alpha1), (COVER_WIDTH - 160 + rand_offset_y, 160, rand_alpha2)]:
         overlay = Image.new("RGBA", (COVER_WIDTH, COVER_HEIGHT), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
         od.ellipse(

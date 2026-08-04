@@ -39,6 +39,22 @@ class LogUnitTests(unittest.TestCase):
         result = redact_sensitive(text)
         self.assertNotIn("mysecret123", result)
 
+    def test_redact_sensitive_preserves_password_route(self):
+        text = "POST /api/v2/auth/change-password -> 200 (98ms)"
+        self.assertEqual(redact_sensitive(text), text)
+
+    def test_redact_sensitive_masks_json_credentials(self):
+        text = (
+            'req_body={"password":"JsonPassword!",'
+            '"appSecret":"CustomWechatSecret!",'
+            '"apiKey":"custom-provider-token"}'
+        )
+        result = redact_sensitive(text)
+        self.assertNotIn("JsonPassword!", result)
+        self.assertNotIn("CustomWechatSecret!", result)
+        self.assertNotIn("custom-provider-token", result)
+        self.assertGreaterEqual(result.count("***REDACTED***"), 3)
+
     def test_redact_preserves_normal_text(self):
         text = "AI 请求: model=gpt-4o json_mode=False prompt_len=500"
         result = redact_sensitive(text)
@@ -242,9 +258,30 @@ class LogApiTests(unittest.TestCase):
 
     def test_12_access_log_present(self):
         # 发送几个请求后检查 access 日志
-        self.client.request("/api/v2/health")
+        self.client.request("/api/v2/bootstrap")
         status, data, _ = self.client.request("/api/v2/logs?q=access&limit=20")
         self.assertEqual(status, 200)
+        self.assertGreater(data["total"], 0)
+
+    def test_13_access_log_never_contains_request_or_response_bodies(self):
+        secret = "CustomWechatSecretForAccessLog!"
+        status, _, _ = self.client.request(
+            "/api/v2/settings/wechat/verify-and-save",
+            "POST",
+            {
+                "accountName": "日志脱敏测试号",
+                "appId": "wx-test-log-redaction",
+                "appSecret": secret,
+                "thumbMediaId": "thumb-test-log-redaction",
+            },
+        )
+        self.assertEqual(status, 200)
+        status, data, _ = self.client.request("/api/v2/logs?limit=1000")
+        self.assertEqual(status, 200)
+        serialized = json.dumps(data, ensure_ascii=False)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("req_body=", serialized)
+        self.assertNotIn("resp_body=", serialized)
 
 
 if __name__ == "__main__":

@@ -9,13 +9,26 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from logger_config import get_logger
 from secure_http import SecureHttpError, request_bytes
 from test_mode import enabled as test_adapter_enabled
 
 logger = get_logger("ai_engine")
+
+
+def _env_int(name: str, default: int) -> int:
+    """P1-24: 安全读取环境变量为 int，转换失败时返回默认值。"""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# #185 AI 请求超时可配置，默认 90 秒，避免长耗时请求无限制阻塞。
+# 与 workflow.py 的分步超时（STUDIO_TIMEOUT_*）共同覆盖长运行操作。
+AI_REQUEST_TIMEOUT = _env_int("STUDIO_AI_REQUEST_TIMEOUT", 90)
 
 
 class AIEngineError(RuntimeError):
@@ -41,28 +54,92 @@ class AIConfig:
 class AIEngine:
     def __init__(self, config: dict[str, Any]):
         self.test_mode = test_adapter_enabled("STUDIO_TEST_AI")
+        # P1-24: int/float 转换保护，配置非法时回退到默认值
+        try:
+            _temperature = float(config.get("temperature", 0.4))
+        except (TypeError, ValueError):
+            _temperature = 0.4
+        try:
+            _max_tokens = int(config.get("maxTokens", 4096))
+        except (TypeError, ValueError):
+            _max_tokens = 4096
         self.config = AIConfig(
             base_url=str(config.get("baseUrl") or "https://api.openai.com/v1").rstrip("/"),
             api_key=str(config.get("apiKey") or ""),
             model=str(config.get("model") or "gpt-4.1-mini"),
-            temperature=float(config.get("temperature", 0.4)),
-            max_tokens=int(config.get("maxTokens", 4096)),
+            temperature=_temperature,
+            max_tokens=_max_tokens,
         )
+        # A5 修复：可选的 backup 模型配置，主模型连续失败2次后自动切换
+        backup_base_url = str(config.get("backupBaseUrl") or "").rstrip("/")
+        backup_api_key = str(config.get("backupApiKey") or "")
+        backup_model = str(config.get("backupModel") or "")
+        if backup_base_url and backup_api_key and backup_model:
+            self.backup_config = AIConfig(
+                base_url=backup_base_url,
+                api_key=backup_api_key,
+                model=backup_model,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
+        else:
+            self.backup_config = None
+        # #142 备用模型切换通知回调：主模型连续失败后切换到 backup 模型时触发，
+        # 由 workflow 层注册以在任务时间线记录事件。回调签名为 (main_model, backup_model, reason)。
+        self.on_backup_switch: Callable[[str, str, str], None] | None = None
 
     @staticmethod
     def _sanitize_prompt_input(text: str) -> str:
+        """过滤用户输入中的 Prompt 注入模式。
+
+        覆盖英文和中文的常见注入模式，包括：
+        - 指令覆盖型：ignore previous instructions / 忽略之前的指令
+        - 角色扮演型：you are a/now / 你现在是
+        - 角色前缀型：system: / assistant: / 系统：/ 助手：
+        - XML 标签型：<system>...</system> / [SYSTEM]
+        - 零宽字符混淆
+        """
         if not isinstance(text, str) or not text:
             return text
         original = text
-        # 中和 "ignore previous instructions" 等指令覆盖型注入（忽略大小写）
+        # 去除零宽字符和不可见 Unicode（防混淆绕过）
+        text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
+        # 将全角英文字母/数字归一化为半角（防 Ｓystem: 绕过）
+        text = text.translate(str.maketrans(
+            "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+        ))
+        # --- 英文注入模式 ---
+        # 指令覆盖型
         text = re.sub(r"ignore\s+previous\s+instructions", "[filtered]", text, flags=re.IGNORECASE)
-        # 中和角色扮演型注入：以 "you are a..." / "you are now..." 等开头的角色指派
+        text = re.sub(r"forget\s+(all\s+)?(previous|prior)\s+(instructions?|prompts?|rules?)", "[filtered]", text, flags=re.IGNORECASE)
+        text = re.sub(r"disregard\s+(all\s+)?(previous|prior)\s+(instructions?|prompts?)", "[filtered]", text, flags=re.IGNORECASE)
+        # 角色扮演型
         text = re.sub(r"(?i)\byou are (a|an|now|no longer)\b[^\n]*", "[filtered]", text)
-        # 中和行首的 "system:" / "assistant:" 等角色前缀
-        text = re.sub(r"(?im)^\s*(system|assistant)\s*:", "[filtered]", text)
+        text = re.sub(r"(?i)\bact as (a|an|if)\b[^\n]*", "[filtered]", text)
+        # 角色前缀型
+        text = re.sub(r"(?im)^\s*(system|assistant|user|admin)\s*:", "[filtered]", text)
+        # XML/标签型
+        text = re.sub(r"(?i)<\/?(system|assistant|instruction|prompt|admin)\b[^>]*>", "[filtered]", text)
+        text = re.sub(r"(?im)^\s*\[(system|assistant|instruction|admin)\]", "[filtered]", text)
+        # --- 中文注入模式 ---
+        text = re.sub(r"忽略(之前|之前所有|上面|以上|前面)的(指令|提示|规则|指示)", "[filtered]", text)
+        text = re.sub(r"无视(之前|上面|以上|前面)的(指令|提示|规则|指示)", "[filtered]", text)
+        text = re.sub(r"忘记(之前|上面|以上|前面)的(指令|提示|规则|指示)", "[filtered]", text)
+        text = re.sub(r"(?i)你现在是(一个|一名)?[^\n]*", "[filtered]", text)
+        text = re.sub(r"(?i)请你(扮演|充当|模拟)[^\n]*", "[filtered]", text)
+        text = re.sub(r"(?im)^\s*(系统|助手|管理员)\s*[：:]", "[filtered]", text)
         if text != original:
             logger.warning("检测到提示词注入模式，已对用户输入进行过滤")
         return text
+
+    def _notify_backup_switch(self, main_model: str, backup_model: str, reason: str) -> None:
+        """#142 通知外部回调：主模型已切换到备用模型。"""
+        if self.on_backup_switch is not None:
+            try:
+                self.on_backup_switch(main_model, backup_model, reason)
+            except Exception:  # noqa: BLE001
+                logger.warning("备用模型切换回调执行失败", exc_info=True)
 
     def _chat(self, system: str, user: str, *, json_mode: bool = False) -> str:
         if self.test_mode:
@@ -71,11 +148,15 @@ class AIEngine:
             raise AIConfigurationRequired()
         # 仅过滤用户可控输入；system 提示词由开发者控制，不做处理
         user = self._sanitize_prompt_input(user)
-        url = self.config.base_url + "/chat/completions"
+        # A5 修复：主模型连续失败2次（HTTP 5xx 或连接错误）后切换到 backup 模型
+        active_config = self.config
+        switched_to_backup = False
+        server_failures = 0  # 连续 5xx / 连接错误次数
+        url = active_config.base_url + "/chat/completions"
         payload: dict[str, Any] = {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            "model": active_config.model,
+            "temperature": active_config.temperature,
+            "max_tokens": active_config.max_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -83,10 +164,15 @@ class AIEngine:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        logger.info("AI 请求: model=%s json_mode=%s prompt_len=%d", self.config.model, json_mode, len(user))
+        logger.info("AI 请求: model=%s json_mode=%s prompt_len=%d", active_config.model, json_mode, len(user))
         start_time = time.monotonic()
         max_retries = 3
-        retryable_statuses = {429, 500, 502, 503, 504}
+        rate_limit_status = 429
+        server_error_statuses = {500, 502, 503, 504}
+        retryable_statuses = {rate_limit_status} | server_error_statuses
+        # R4 修复：可重试的安全连接错误码（网络超时/连接失败），SSL 证书等安全错误不重试
+        _RETRIABLE_SECURE_CODES = {"connection_failed", "dns_failed"}
+        _connection_retry_used = False
         status = 0
         raw = ""
         elapsed = 0.0
@@ -97,18 +183,43 @@ class AIEngine:
                     method="POST",
                     body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                     headers={
-                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Authorization": f"Bearer {active_config.api_key}",
                         "Content-Type": "application/json",
                         "Accept": "application/json",
                         "User-Agent": "WeiXinGZH-Studio/2.1.3",
                     },
-                    timeout=90,
+                    timeout=AI_REQUEST_TIMEOUT,
                     max_bytes=4_000_000,
                     require_https=True,
                     reject_redirects=True,
                 )
             except SecureHttpError as exc:
                 elapsed = (time.monotonic() - start_time) * 1000
+                # R4 修复：区分安全错误与网络超时
+                # connection/timeout 类错误可重试1次；SSL 证书等安全错误立即失败
+                if exc.code in _RETRIABLE_SECURE_CODES and not _connection_retry_used:
+                    _connection_retry_used = True
+                    server_failures += 1
+                    # A5 修复：连续2次服务端/连接失败后切换到 backup 模型
+                    if server_failures >= 2 and self.backup_config and not switched_to_backup:
+                        switched_to_backup = True
+                        active_config = self.backup_config
+                        url = active_config.base_url + "/chat/completions"
+                        payload["model"] = active_config.model
+                        server_failures = 0
+                        _connection_retry_used = False  # backup 模型也允许1次连接重试
+                        logger.warning(
+                            "主模型连续失败 2 次（连接错误），切换到 backup 模型: %s",
+                            active_config.model,
+                        )
+                        self._notify_backup_switch(self.config.model, active_config.model, "连接错误")
+                    else:
+                        logger.warning(
+                            "AI 连接失败 (code=%s, 耗时 %.0fms)，正在重试1次",
+                            exc.code, elapsed,
+                        )
+                        time.sleep(1.0 + random.random())
+                    continue
                 logger.error("AI 安全连接失败 (耗时 %.0fms): %s", elapsed, exc.code)
                 raise AIEngineError("ai_connection_failed", f"模型接口连接失败（安全校验：{exc.code}）") from exc
             except Exception as exc:
@@ -120,6 +231,20 @@ class AIEngine:
             raw = response.body.decode("utf-8", errors="replace")
             # 仅对限流(429)与服务端错误(5xx)重试；其余 4xx 与连接错误立即失败
             if status in retryable_statuses and attempt < max_retries:
+                # A5 修复：5xx 计入连续失败次数，达到2次后切换 backup 模型
+                if status in server_error_statuses:
+                    server_failures += 1
+                    if server_failures >= 2 and self.backup_config and not switched_to_backup:
+                        switched_to_backup = True
+                        active_config = self.backup_config
+                        url = active_config.base_url + "/chat/completions"
+                        payload["model"] = active_config.model
+                        server_failures = 0
+                        logger.warning(
+                            "主模型连续返回 5xx 2 次，切换到 backup 模型: %s",
+                            active_config.model,
+                        )
+                        self._notify_backup_switch(self.config.model, active_config.model, "服务端 5xx 错误")
                 delay = 1.0 * (2 ** attempt) + random.random()
                 logger.warning(
                     "AI 返回 HTTP %d，第 %d/%d 次重试 (等待 %.1fs)",
@@ -167,9 +292,9 @@ class AIEngine:
             return json.dumps(
                 {
                     "checks": [
-                        {"id": "facts", "label": "事实与来源", "status": "passed", "message": "引用内容与输入一致"},
-                        {"id": "structure", "label": "结构完整", "status": "passed", "message": "结构清晰"},
-                        {"id": "wechat", "label": "公众号可读性", "status": "passed", "message": "段落长度适中"},
+                        {"id": "facts", "label": "事实与来源", "status": "passed", "score": 95, "message": "引用内容与输入一致"},
+                        {"id": "structure", "label": "结构完整", "status": "passed", "score": 90, "message": "结构清晰"},
+                        {"id": "wechat", "label": "公众号可读性", "status": "passed", "score": 85, "message": "段落长度适中"},
                     ]
                 },
                 ensure_ascii=False,
@@ -263,6 +388,85 @@ class AIEngine:
                 "严格事实正文存在未标注来源的长段落：" + "；".join(uncovered[:3]),
             )
 
+    # --- A1 修复：非严格模式幻觉检测 ---
+    # 检测正文中包含具体数字、日期、人名等事实性陈述但未标注来源的段落
+    _FACTUAL_PATTERNS = [
+        re.compile(r"\d{4}\s*年"),              # 2024年
+        re.compile(r"\d+[.,，]?\d*\s*[%％]"),   # 百分比
+        re.compile(r"\d+\s*[亿万]"),            # 数字+单位
+        re.compile(r"据(统计|报告|调查|研究)"),  # 据统计
+        re.compile(r"显示|表明|证实"),           # 显示/表明/证实
+        re.compile(r"[A-Z][a-z]+\s[A-Z][a-z]+"),# 人名（英文）
+    ]
+
+    @classmethod
+    def _detect_unsourced_facts(cls, content: str, source_text: str) -> list[str]:
+        """检测非严格模式下可能包含虚构事实的段落。
+
+        返回需要人工核查的段落摘要列表（可能为空）。
+        不阻断流程，而是作为审校项展示给用户。
+        """
+        has_sources = "[来源" in source_text
+        if not has_sources:
+            return []  # 无来源可比对时跳过
+        warnings: list[str] = []
+        for paragraph in re.split(r"\n\s*\n", content):
+            clean = paragraph.strip()
+            if not clean or clean.startswith("#") or clean.startswith("```") or clean.startswith("!"):
+                continue
+            plain = re.sub(r"[`*_>#\-]", "", clean).strip()
+            if len(plain) < 50:
+                continue
+            # 如果段落已标注来源，跳过
+            if re.search(r"\[来源\d+\]", clean) or "现有来源无法确认" in clean:
+                continue
+            # 检测是否包含事实性陈述
+            for pattern in cls._FACTUAL_PATTERNS:
+                if pattern.search(plain):
+                    warnings.append(plain[:80])
+                    break
+        return warnings
+
+    # --- A3 修复：目标字数校验 ---
+    @staticmethod
+    def _check_word_count(content: str, target_length: int) -> dict[str, Any]:
+        """校验生成正文的字数是否接近目标。"""
+        # 统计中文字符 + 英文单词
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", content))
+        english_words = len(re.findall(r"[a-zA-Z]+", content))
+        actual_length = chinese_chars + english_words
+        if target_length <= 0:
+            return {"ok": True, "actual": actual_length, "detail": ""}
+        ratio = actual_length / target_length
+        if ratio < 0.5:
+            return {
+                "ok": False,
+                "actual": actual_length,
+                "detail": f"正文 {actual_length} 字，仅达到目标字数 {target_length} 的 {ratio:.0%}，建议重新生成或补充内容",
+            }
+        if ratio < 0.7:
+            return {
+                "ok": False,
+                "actual": actual_length,
+                "detail": f"正文 {actual_length} 字，目标 {target_length} 字（{ratio:.0%}），偏短",
+            }
+        return {"ok": True, "actual": actual_length, "detail": f"正文 {actual_length} 字（目标 {target_length} 字）"}
+
+    # --- X6 修复：系统提示词泄漏检测 ---
+    _SYSTEM_PROMPT_MARKERS = [
+        "严格事实模式", "普通创作模式", "返回 JSON",
+        "你是资深微信公众号", "你是专业微信公众号作者", "你是公众号发布前审校员",
+        "事实策略：", "文章生成要求：", "可信来源：",
+    ]
+
+    @classmethod
+    def _detect_prompt_leakage(cls, content: str) -> bool:
+        """检测 AI 输出是否泄漏了系统提示词。"""
+        for marker in cls._SYSTEM_PROMPT_MARKERS:
+            if marker in content:
+                return True
+        return False
+
     def draft(
         self,
         goal: str,
@@ -311,11 +515,18 @@ class AIEngine:
         content = self._chat(system, user)
         if len(content) < 200:
             raise AIEngineError("draft_too_short", "模型生成的正文过短")
+        # A3 修复：字数校验（不阻断，但记录日志）
+        word_check = self._check_word_count(content, target_length)
+        if not word_check["ok"]:
+            logger.warning("正文字数偏差: %s", word_check["detail"])
+        # X6 修复：提示词泄漏检测
+        if self._detect_prompt_leakage(content):
+            logger.warning("检测到 AI 输出可能包含系统提示词泄漏，建议人工核查")
         if strict_facts:
             self._validate_strict_draft(content, source_text)
         return content
 
-    def review(self, body_markdown: str, source_text: str) -> list[dict[str, str]]:
+    def review(self, body_markdown: str, source_text: str) -> list[dict[str, Any]]:
         system = (
             "你是公众号发布前审校员。必须检查以下必检项，每项都不可省略：\n"
             "1. 合规性：是否包含政治敏感、违法广告法、谣言等风险内容\n"
@@ -323,28 +534,114 @@ class AIEngine:
             "3. 事实准确性：事实性陈述是否与来源一致，有无虚构数据/人物/日期\n"
             "4. 结构完整性：标题、摘要、正文是否完整，逻辑是否通顺\n"
             "5. 公众号可读性：段落长度、配图位置是否适合移动端阅读\n"
-            "返回 JSON：{\"checks\":[{\"id\":...,\"label\":...,\"status\":\"passed|warning|failed\",\"message\":...}]}。"
+            "每项检查需给出 0-100 的质量评分（score 字段）：passed 为 80-100，warning 为 60-79，failed 为 0-59。\n"
+            "返回 JSON：{\"checks\":[{\"id\":...,\"label\":...,\"status\":\"passed|warning|failed\",\"score\":0-100,\"message\":...}]}。"
         )
         user = f"来源：\n{source_text[:50_000]}\n\n正文：\n{body_markdown[:80_000]}"
         data = self._json_object(self._chat(system, user, json_mode=True))
         checks = data.get("checks")
         if not isinstance(checks, list):
             raise AIEngineError("review_invalid", "模型返回的审校结果无效")
-        result: list[dict[str, str]] = []
+        result: list[dict[str, Any]] = []
+        scores: list[int] = []
         for index, item in enumerate(checks[:10]):
             if not isinstance(item, dict):
                 continue
             status = str(item.get("status") or "warning")
             if status not in {"passed", "warning", "failed"}:
                 status = "warning"
+            # A4 修复：提取 score 字段，如果 AI 未返回则按 status 推断
+            raw_score = item.get("score")
+            try:
+                score = int(raw_score)
+            except (TypeError, ValueError):
+                score = 100 if status == "passed" else (60 if status == "warning" else 0)
+            score = max(0, min(100, score))
+            scores.append(score)
             result.append(
                 {
                     "id": str(item.get("id") or f"check-{index + 1}"),
                     "label": str(item.get("label") or "审校项")[:80],
                     "status": status,
+                    "score": score,
                     "message": str(item.get("message") or "")[:300],
                 }
             )
         if not result:
             raise AIEngineError("review_invalid", "模型没有返回审校项")
+
+        # A1 修复：非严格模式幻觉检测——检测未标注来源的事实性陈述
+        unsourced = self._detect_unsourced_facts(body_markdown, source_text)
+        if unsourced:
+            result.append({
+                "id": "hallucination_check",
+                "label": "事实性核查",
+                "status": "warning",
+                "score": 60,
+                "message": f"检测到 {len(unsourced)} 个包含数据/日期/引用但未标注来源的段落，请人工核查是否为虚构内容：" + "；".join(unsourced[:3]),
+            })
+            scores.append(60)
+
+        # X6 修复：系统提示词泄漏检测
+        if self._detect_prompt_leakage(body_markdown):
+            result.append({
+                "id": "prompt_leakage",
+                "label": "提示词泄漏检测",
+                "status": "warning",
+                "score": 60,
+                "message": "正文可能包含系统提示词片段，请检查并删除指令性文字",
+            })
+            scores.append(60)
+
+        # X1 修复：AI 生成内容版权声明审校项
+        # 大语言模型可能在不经意间复现训练语料中的受版权保护文本，
+        # 此审校项提醒用户在发布前人工核查版权风险。
+        result.append({
+            "id": "copyright_notice",
+            "label": "版权与原创性声明",
+            "status": "warning",
+            "score": 60,
+            "message": "本文由 AI 辅助生成，可能存在与已有作品相似的表述。发布前请人工核查内容原创性，"
+                       "确保不侵犯他人著作权；如声明原创，请确认内容符合公众号原创规则。",
+        })
+        scores.append(60)
+
+        # A4 修复：计算加权综合评分
+        overall_score = sum(scores) // len(scores) if scores else 0
+        if overall_score >= 80:
+            overall_status = "passed"
+        elif overall_score >= 60:
+            overall_status = "warning"
+        else:
+            overall_status = "failed"
+        result.append({
+            "id": "overall_score",
+            "label": "综合质量评分",
+            "status": overall_status,
+            "score": overall_score,
+            "message": f"综合评分: {overall_score}/100",
+        })
+
         return result
+
+    def summarize(self, body_markdown: str, *, max_length: int = 120) -> str:
+        """#125 根据正文生成摘要。
+
+        使用 AI 从正文中提取/生成简洁摘要，供前端在编辑摘要字段时辅助使用。
+        返回不超过 max_length 字符的摘要文本。
+        """
+        if not body_markdown or not body_markdown.strip():
+            raise AIEngineError("summary_input_empty", "正文为空，无法生成摘要")
+        system = (
+            "你是公众号内容编辑。请根据提供的正文生成一段简洁的摘要，"
+            f"字数不超过 {max_length} 字，概括文章核心观点与关键信息。"
+            "直接输出摘要文本，不要包含标题、引号、Markdown 标记或额外说明。"
+        )
+        user = f"正文：\n{body_markdown[:80_000]}"
+        summary = self._chat(system, user)
+        summary = summary.strip().strip('"').strip("'").strip()
+        if len(summary) > max_length:
+            summary = summary[:max_length]
+        if not summary:
+            raise AIEngineError("summary_empty", "模型未能生成有效摘要")
+        return summary

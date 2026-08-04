@@ -351,14 +351,22 @@ def select_server_port(server_only: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 def wait_for_server(url: str, timeout: float = SERVER_START_TIMEOUT) -> bool:
-    """轮询健康检查端点，等待服务器就绪。"""
+    """轮询会话端点，等待服务器就绪。
+
+    使用 /api/v2/auth/session（公开端点）代替 /api/v2/health，
+    因为后者在引入用户认证后需要会话才能访问。
+    """
     deadline = time.monotonic() + timeout
-    health_url = url.rstrip("/") + "/api/v2/health"
+    check_url = url.rstrip("/") + "/api/v2/auth/session"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(health_url, timeout=2) as response:
+            with urllib.request.urlopen(check_url, timeout=2) as response:
                 if response.status == 200:
                     return True
+        except urllib.error.HTTPError as exc:
+            # 401 也表示服务器已就绪（只是未认证）
+            if exc.code in (200, 401):
+                return True
         except Exception:  # noqa: BLE001
             time.sleep(0.3)
     return False
@@ -596,6 +604,20 @@ def main() -> None:
 
     def _navigate_when_ready() -> None:
         if wait_for_server(url, timeout=SERVER_START_TIMEOUT):
+            # 检查是否有初始密码需要展示（首次启动）
+            try:
+                from db import db_path
+                password_file = db_path().parent / ".initial_password"
+                if password_file.exists():
+                    password = password_file.read_text(encoding="utf-8").strip()
+                    if password:
+                        _show_dialog(
+                            "info",
+                            APP_TITLE,
+                            f"首次启动已创建管理员账户\n\n用户名: admin\n初始密码: {password}\n\n请在登录后修改密码。",
+                        )
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 window.load_url(url)
             except Exception:  # noqa: BLE001

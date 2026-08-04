@@ -16,24 +16,22 @@ def run(command: list[str]) -> None:
 
 
 def main() -> None:
+    node = shutil.which("node")
+    if node:
+        run([node, "--check", "web/app.js"])
+    else:
+        print("未安装 Node.js：跳过 JavaScript 语法检查。")
     if not compileall.compile_dir(ROOT / "backend", quiet=1):
         raise SystemExit("Python 语法检查失败")
     run([
         sys.executable,
         "-m",
         "unittest",
+        "discover",
+        "-s",
+        "tests",
         "-v",
-        "tests.test_release",
-        "tests.test_security_211",
-        "tests.test_audit_212",
-        "tests.test_audit_213",
-        "tests.test_desktop",
     ])
-    node = shutil.which("node")
-    if node:
-        run([node, "--check", "web/app.js"])
-    else:
-        print("未安装 Node.js：浏览器原生 JavaScript 不依赖 Node，跳过 node --check。")
     if os.environ.get("RUN_BROWSER_E2E") == "1":
         run([sys.executable, "tests/test_e2e.py"])
         print("核心自动化与真实服务浏览器 E2E 均通过。")

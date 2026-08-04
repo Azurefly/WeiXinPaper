@@ -9,6 +9,7 @@ __pycache__/
 
 data/.master.key
 data/.master.key.*
+data/.initial_password
 
 .trae-html-share-packages/
 system-critique/

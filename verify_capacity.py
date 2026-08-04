@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.cookiejar import CookieJar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -34,32 +35,43 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def request(base: str, path: str, method: str = "GET", body: dict[str, Any] | None = None, headers=None):
-    data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        base + path,
-        data=data,
-        method=method,
-        headers={"Accept": "application/json", "Content-Type": "application/json", **(headers or {})},
-    )
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            raw = response.read()
+class Client:
+    def __init__(self, base: str):
+        self.base = base
+        self.csrf_token = ""
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def request(self, path: str, method: str = "GET", body: dict[str, Any] | None = None, headers=None):
+        data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": self.base,
+            **(headers or {}),
+        }
+        if self.csrf_token:
+            request_headers["X-CSRF-Token"] = self.csrf_token
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=request_headers)
+        started = time.perf_counter()
+        try:
+            with self.opener.open(req, timeout=20) as response:
+                raw = response.read()
+                value = json.loads(raw) if raw else {}
+                if isinstance(value, dict) and value.get("csrfToken"):
+                    self.csrf_token = str(value["csrfToken"])
+                return response.status, value, (time.perf_counter() - started) * 1000
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
             value = json.loads(raw) if raw else {}
-            return response.status, value, (time.perf_counter() - started) * 1000
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        value = json.loads(raw) if raw else {}
-        return exc.code, value, (time.perf_counter() - started) * 1000
+            return exc.code, value, (time.perf_counter() - started) * 1000
 
 
-def wait_server(base: str, process: subprocess.Popen[str]) -> None:
+def wait_server(client: Client, process: subprocess.Popen[str]) -> None:
     for _ in range(200):
         if process.poll() is not None:
             raise RuntimeError(process.stdout.read() if process.stdout else "server exited")
         try:
-            status, _, _ = request(base, "/api/v2/health")
+            status, _, _ = client.request("/api/v2/health")
             if status == 200:
                 return
         except Exception:
@@ -165,17 +177,37 @@ def run_validation(article_count: int, edit_count: int) -> dict[str, Any]:
             text=True,
         )
         try:
-            wait_server(base, process)
+            client = Client(base)
+            wait_server(client, process)
+            initial_password = (temp_root / ".initial_password").read_text(encoding="utf-8").strip()
+            status, login, _ = client.request(
+                "/api/v2/auth/login",
+                method="POST",
+                body={"username": "admin", "password": initial_password},
+            )
+            if status != 200 or not login.get("ok"):
+                raise RuntimeError(f"capacity login failed: status={status}, payload={login}")
+            new_password = "CapacityStudio9A"
+            status, changed, _ = client.request(
+                "/api/v2/auth/change-password",
+                method="POST",
+                body={
+                    "oldPassword": initial_password,
+                    "newPassword": new_password,
+                    "confirmPassword": new_password,
+                },
+            )
+            if status != 200 or not changed.get("ok"):
+                raise RuntimeError(f"capacity password change failed: status={status}, payload={changed}")
             initial_rss = rss_mb(process.pid)
-            status, first, first_ms = request(base, "/api/v2/projects?includeArchived=false&limit=50&offset=0")
+            status, first, first_ms = client.request("/api/v2/projects?includeArchived=false&limit=50&offset=0")
             if status != 200 or first.get("total") != article_count or len(first.get("items") or []) != 50:
                 raise RuntimeError(f"first page failed: status={status}, payload={first}")
             last_offset = max(0, article_count - 50)
-            status, last, last_ms = request(base, f"/api/v2/projects?includeArchived=false&limit=50&offset={last_offset}")
+            status, last, last_ms = client.request(f"/api/v2/projects?includeArchived=false&limit=50&offset={last_offset}")
             if status != 200 or not last.get("items"):
                 raise RuntimeError("last page failed")
-            status, searched, search_ms = request(
-                base,
+            status, searched, search_ms = client.request(
                 "/api/v2/projects?includeArchived=false&limit=50&q=" + urllib.parse.quote("唯一检索标记"),
             )
             if status != 200 or searched.get("total") != 1:
@@ -184,8 +216,7 @@ def run_validation(article_count: int, edit_count: int) -> dict[str, Any]:
             page_latencies: list[float] = []
             for _ in range(60):
                 offset = random.randrange(0, max(1, article_count // 50)) * 50
-                status, payload, elapsed = request(
-                    base,
+                status, payload, elapsed = client.request(
                     f"/api/v2/projects?includeArchived=false&limit=50&offset={offset}",
                 )
                 if status != 200 or len(payload.get("items") or []) > 50:
@@ -193,14 +224,13 @@ def run_validation(article_count: int, edit_count: int) -> dict[str, Any]:
                 page_latencies.append(elapsed)
 
             project_id = "cap_000000"
-            status, project, _ = request(base, f"/api/v2/projects/{project_id}")
+            status, project, _ = client.request(f"/api/v2/projects/{project_id}")
             if status != 200:
                 raise RuntimeError("edit target unavailable")
             edit_latencies: list[float] = []
             for index in range(edit_count):
                 body = "持续编辑稳定性验证。" * 120 + f"\n\n保存序号：{index}"
-                status, project, elapsed = request(
-                    base,
+                status, project, elapsed = client.request(
                     f"/api/v2/projects/{project_id}",
                     method="PATCH",
                     body={"bodyMarkdown": body},
@@ -210,7 +240,7 @@ def run_validation(article_count: int, edit_count: int) -> dict[str, Any]:
                     raise RuntimeError(f"continuous edit failed at {index}: {project}")
                 edit_latencies.append(elapsed)
 
-            status, versions, versions_ms = request(base, f"/api/v2/projects/{project_id}/versions")
+            status, versions, versions_ms = client.request(f"/api/v2/projects/{project_id}/versions")
             if status != 200 or len(versions.get("items") or []) > 100:
                 raise RuntimeError("version retention limit failed")
             final_rss = rss_mb(process.pid)

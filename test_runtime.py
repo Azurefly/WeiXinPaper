@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
+from http.cookiejar import CookieJar
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -17,6 +19,30 @@ def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class Client:
+    def __init__(self, base: str):
+        self.base = base
+        self.csrf_token = ""
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def request(self, path: str, method: str = "GET", body: dict | None = None):
+        payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"Accept": "application/json", "Content-Type": "application/json", "Origin": self.base}
+        if self.csrf_token:
+            headers["X-CSRF-Token"] = self.csrf_token
+        request = urllib.request.Request(self.base + path, data=payload, method=method, headers=headers)
+        try:
+            with self.opener.open(request, timeout=10) as response:
+                raw = response.read()
+                value = json.loads(raw) if raw else {}
+                if isinstance(value, dict) and value.get("csrfToken"):
+                    self.csrf_token = str(value["csrfToken"])
+                return response.status, value
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            return exc.code, json.loads(raw) if raw else {}
 
 
 def main() -> None:
@@ -51,18 +77,35 @@ def main() -> None:
             with urllib.request.urlopen(base + "/") as response:
                 html = response.read().decode("utf-8")
             assert "公众号 AI Studio" in html
-            request = urllib.request.Request(
-                base + "/api/v2/workflows",
-                data=json.dumps({"sourceInput": "运行包验收", "autoReview": False}, ensure_ascii=False).encode("utf-8"),
-                method="POST",
-                headers={"Content-Type": "application/json"},
+            client = Client(base)
+            initial_password = (Path(temp) / ".initial_password").read_text(encoding="utf-8").strip()
+            status, login = client.request(
+                "/api/v2/auth/login",
+                "POST",
+                {"username": "admin", "password": initial_password},
             )
-            with urllib.request.urlopen(request) as response:
-                created = json.loads(response.read())
+            assert status == 200 and login["mustChangePassword"], login
+            new_password = "RuntimeStudio9A"
+            status, changed = client.request(
+                "/api/v2/auth/change-password",
+                "POST",
+                {
+                    "oldPassword": initial_password,
+                    "newPassword": new_password,
+                    "confirmPassword": new_password,
+                },
+            )
+            assert status == 200 and changed["ok"], changed
+            status, created = client.request(
+                "/api/v2/workflows",
+                "POST",
+                {"sourceInput": "运行包验收", "autoReview": False},
+            )
+            assert status == 202, created
             task_id = created["task"]["id"]
             for _ in range(100):
-                with urllib.request.urlopen(base + "/api/v2/tasks/" + task_id) as response:
-                    task = json.loads(response.read())
+                status, task = client.request("/api/v2/tasks/" + task_id)
+                assert status == 200, task
                 if task["status"] not in {"queued", "running"}:
                     break
                 time.sleep(0.05)

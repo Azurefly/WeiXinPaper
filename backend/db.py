@@ -15,7 +15,7 @@ from secrets_store import decrypt, encrypt
 
 logger = get_logger("db")
 
-SCHEMA_VERSION = 212
+SCHEMA_VERSION = 213
 
 # ---------------------------------------------------------------------------
 # 数据库锁策略（N1 锁优化）
@@ -29,6 +29,9 @@ SCHEMA_VERSION = 212
 #   - 写操作 / Schema 迁移（init_db 等需串行化的写场景）：使用 _DB_WRITE_LOCK 串行化。
 # connect() 本身不再持有全局锁，普通读写请求均依赖 SQLite 自身的并发控制。
 _DB_WRITE_LOCK = threading.Lock()
+
+# P3 修复：线程局部连接缓存，避免频繁创建/关闭连接
+_thread_local = threading.local()
 
 
 def utc_now() -> str:
@@ -47,21 +50,54 @@ def connect() -> Iterator[sqlite3.Connection]:
     # N1 锁优化：不再使用全局锁包裹整个连接生命周期。
     # 只读操作直接依赖 SQLite WAL 模式 + busy_timeout 实现并发；
     # 需串行化的写场景（如 init_db 的 schema 迁移）由调用方按需持有 _DB_WRITE_LOCK。
-    path = db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    # P3 修复：优先复用线程局部缓存的连接，减少连接创建/关闭开销
+    current_path = str(db_path())
+    conn = getattr(_thread_local, "conn", None)
+    cached_path = getattr(_thread_local, "conn_path", None)
+    if conn is not None and cached_path == current_path:
+        try:
+            conn.execute("SELECT 1")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+    else:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
+    if conn is None:
+        path = Path(current_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        _thread_local.conn = conn
+        _thread_local.conn_path = current_path
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    finally:
-        conn.close()
+    # P3 修复：不关闭连接，放回线程局部缓存供下次复用
+
+
+def close_thread_connections() -> None:
+    """P3 修复：关闭并清理当前线程的缓存连接（主要用于测试）。"""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +188,17 @@ def _start_wal_checkpoint_thread() -> None:
         daemon=True,
     )
     _wal_checkpoint_thread.start()
+
+
+def stop_wal_checkpoint_thread() -> None:
+    """P1-21: 停止 WAL checkpoint 守护线程（服务关闭时调用）。"""
+    global _wal_checkpoint_stop, _wal_checkpoint_thread
+    if _wal_checkpoint_stop is not None:
+        _wal_checkpoint_stop.set()
+    if _wal_checkpoint_thread is not None and _wal_checkpoint_thread.is_alive():
+        _wal_checkpoint_thread.join(timeout=5)
+    _wal_checkpoint_stop = None
+    _wal_checkpoint_thread = None
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -278,6 +325,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             auto_review INTEGER NOT NULL DEFAULT 1,
             retry_mode TEXT NOT NULL DEFAULT 'full',
             base_revision INTEGER NOT NULL DEFAULT 1,
+            checkpoint_step TEXT NOT NULL DEFAULT '',
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL,
@@ -335,6 +383,25 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             verified_at TEXT NOT NULL DEFAULT '',
             message TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS users(
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            must_change_password INTEGER NOT NULL DEFAULT 1,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS sessions(
+            token_hash TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
         """
     )
 
@@ -447,6 +514,7 @@ def init_db() -> None:
                 "auto_review": "INTEGER NOT NULL DEFAULT 1",
                 "retry_mode": "TEXT NOT NULL DEFAULT 'full'",
                 "base_revision": "INTEGER NOT NULL DEFAULT 1",
+                "checkpoint_step": "TEXT NOT NULL DEFAULT ''",
                 "started_at": "TEXT NOT NULL DEFAULT ''",
                 "finished_at": "TEXT NOT NULL DEFAULT ''",
                 "updated_at": "TEXT NOT NULL DEFAULT ''",
@@ -476,6 +544,10 @@ def init_db() -> None:
                     "autoReview": True,
                     "lastVerifiedAt": "",
                     "lastVerifyMessage": "",
+                    "backupBaseUrl": "",
+                    "backupApiKey": "",
+                    "backupApiKeyHintStored": "",
+                    "backupModel": "",
                 },
                 "wechat": {
                     "appId": "",
@@ -496,6 +568,7 @@ def init_db() -> None:
                 )
             for key, field, hint_field in (
                 ("ai", "apiKey", "apiKeyHintStored"),
+                ("ai", "backupApiKey", "backupApiKeyHintStored"),
                 ("wechat", "appSecret", "appSecretHintStored"),
             ):
                 row = conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
@@ -524,17 +597,16 @@ def init_db() -> None:
                         (utc_now(), repr(exc)[:2000], migration_id),
                     )
                     conn.commit()
-            except Exception:
-                pass
-            conn.close()
+            except Exception as log_exc:
+                logger.warning("迁移日志写入失败: %s", log_exc)
             if backup:
                 _restore_database(backup, path)
             raise RuntimeError(f"数据库迁移失败，已执行回滚：{exc}") from exc
         finally:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as log_exc:
+                logger.warning("连接关闭失败: %s", log_exc)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -603,6 +675,7 @@ def row_to_task(row: sqlite3.Row) -> dict[str, Any]:
         "autoReview": bool(_value(row, "auto_review", 1)),
         "retryMode": _value(row, "retry_mode", "full"),
         "baseRevision": int(_value(row, "base_revision", 1)),
+        "checkpointStep": _value(row, "checkpoint_step"),
         "startedAt": _value(row, "started_at"),
         "finishedAt": _value(row, "finished_at"),
         "updatedAt": _value(row, "updated_at"),
@@ -611,8 +684,11 @@ def row_to_task(row: sqlite3.Row) -> dict[str, Any]:
 
 def _decrypt_setting(key: str, value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
-    if key == "ai" and result.get("apiKey"):
-        result["apiKey"] = decrypt(str(result["apiKey"]))
+    if key == "ai":
+        if result.get("apiKey"):
+            result["apiKey"] = decrypt(str(result["apiKey"]))
+        if result.get("backupApiKey"):
+            result["backupApiKey"] = decrypt(str(result["backupApiKey"]))
     if key == "wechat" and result.get("appSecret"):
         result["appSecret"] = decrypt(str(result["appSecret"]))
     return result
@@ -632,10 +708,15 @@ def get_setting(key: str) -> dict[str, Any]:
 
 def set_setting(key: str, value: dict[str, Any]) -> None:
     stored = dict(value)
-    if key == "ai" and stored.get("apiKey"):
-        secret = str(stored["apiKey"])
-        stored["apiKeyHintStored"] = secret[-4:]
-        stored["apiKey"] = encrypt(secret)
+    if key == "ai":
+        if stored.get("apiKey"):
+            secret = str(stored["apiKey"])
+            stored["apiKeyHintStored"] = secret[-4:]
+            stored["apiKey"] = encrypt(secret)
+        if stored.get("backupApiKey"):
+            secret = str(stored["backupApiKey"])
+            stored["backupApiKeyHintStored"] = secret[-4:]
+            stored["backupApiKey"] = encrypt(secret)
     if key == "wechat" and stored.get("appSecret"):
         secret = str(stored["appSecret"])
         stored["appSecretHintStored"] = secret[-4:]
@@ -656,10 +737,17 @@ def record_project_version(conn: sqlite3.Connection, project_id: str, reason: st
         "INSERT INTO project_versions(project_id,revision,snapshot_json,reason,created_at) VALUES(?,?,?,?,?)",
         (project_id, row["revision"], json.dumps(row_to_project(row), ensure_ascii=False), reason[:200], utc_now()),
     )
+    # P1-18: 删除超额版本时，保护被活跃任务引用为 base_revision 的快照不被淘汰。
+    # 活跃任务（queued/running/failed）的 base_revision 快照是回滚所必需的，
+    # 如果被 100 条上限淘汰，_rollback_to_base_revision 将无法回滚。
     conn.execute(
         "DELETE FROM project_versions WHERE project_id=? AND id NOT IN "
-        "(SELECT id FROM project_versions WHERE project_id=? ORDER BY id DESC LIMIT 100)",
-        (project_id, project_id),
+        "(SELECT id FROM project_versions WHERE project_id=? ORDER BY id DESC LIMIT 100) "
+        "AND revision NOT IN ("
+        "  SELECT DISTINCT base_revision FROM tasks "
+        "  WHERE project_id=? AND status IN ('queued','running','failed') AND base_revision > 0"
+        ")",
+        (project_id, project_id, project_id),
     )
 
 

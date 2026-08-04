@@ -259,7 +259,7 @@ def request_bytes(
     request_headers = {**dict(headers or {}), "Host": host_header, "Connection": "close"}
     last_error: Exception | None = None
     for ip in addresses:
-        conn: http.client.HTTPConnection
+        conn: http.client.HTTPConnection | None = None
         try:
             conn = (
                 _PinnedHTTPSConnection(parsed.hostname, ip, port, timeout)
@@ -297,8 +297,10 @@ def request_bytes(
         except Exception as exc:  # noqa: BLE001
             last_error = exc
         finally:
-            try:
-                conn.close()  # type: ignore[possibly-undefined]
-            except Exception:
-                pass
+            # 审计修复: conn 可能未赋值（构造连接对象即抛异常），先判空再关闭
+            if conn:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
     raise SecureHttpError("connection_failed", f"无法安全连接外部服务：{last_error}") from last_error

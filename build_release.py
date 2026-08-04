@@ -18,14 +18,21 @@ SOURCE_STEM = f"WeiXinGZH_AI_Studio_{VERSION}_审计修复源码版"
 RUNTIME_STEM = f"WeiXinGZH_AI_Studio_{VERSION}_审计修复运行版"
 
 SOURCE_TOP = {
+    ".github",
     ".gitignore",
     ".test-adapters-enabled",
     "README.md",
     "backend",
+    "build_assets",
     "build_release.py",
+    "build_scripts",
     "data",
+    "desktop.py",
+    "desktop_unix.sh",
+    "desktop_windows.cmd",
     "docs",
     "install.py",
+    "requirements-desktop.txt",
     "setup_unix.sh",
     "setup_windows.cmd",
     "start.py",
@@ -66,13 +73,17 @@ RUNTIME_TOP = {
 
 def excluded(path: Path) -> bool:
     rel = path.relative_to(ROOT)
+    # data/ 只是运行时目录。日志、数据库、迁移备份、初始密码和
+    # 主密钥都可能包含用户内容或凭据，不得进入源码/运行包。
+    if rel.parts and rel.parts[0] == "data":
+        return True
     parts = set(rel.parts)
     if ".git" in parts or "__pycache__" in parts or ".pytest_cache" in parts:
         return True
     if path.suffix in {".pyc", ".pyo", ".zip"}:
         return True
     name = path.name
-    if name == ".env" or name.startswith(".master.key"):
+    if name in {".DS_Store", ".env"} or name.startswith(".master.key"):
         return True
     if name.endswith(".db") or ".db-" in name or name.endswith(".bak"):
         return True
@@ -88,6 +99,7 @@ def copy_top(stage: Path, names: set[str]) -> None:
             raise RuntimeError(f"缺少发布文件：{name}")
         target = stage / name
         if source.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
             for item in source.rglob("*"):
                 if item.is_dir() or excluded(item):
                     continue
@@ -117,8 +129,8 @@ def write_metadata(stage: Path, package_type: str) -> None:
         "level": "release-candidate",
         "generatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "files": len(current_files) + 2,
-        "coreAutomatedTests": 45,
-        "browserServiceE2E": "blocked-by-host-policy-not-passed",
+        "coreAutomatedTests": "full-unittest-discovery-passed-during-build",
+        "browserServiceE2E": "manual-browser-passed-playwright-gate-required",
         "externalCredentialedValidation": "not-run-no-credentials",
         "windowsDpapiValidation": "self-test-shipped-current-environment-not-windows",
         "capacityValidation": "10000-articles-and-100-edits-passed",
@@ -153,9 +165,12 @@ def verify_zip_clean(path: Path, *, runtime: bool) -> None:
         bad = [
             name
             for name in names
-            if any(token in name for token in ("__pycache__", ".pyc", ".master.key", ".env"))
-            or name.endswith(".db")
-            or ".db-" in name
+            if any(token in name for token in ("__pycache__", ".pyc", ".master.key", ".initial_password", ".env"))
+            or Path(name).name.endswith(".db")
+            or ".db-" in Path(name).name
+            or ".db." in Path(name).name
+            or Path(name).name.endswith(".log")
+            or ".log." in Path(name).name
             or "/2.1.0_" in name
             or "/2.1.1_" in name
         ]

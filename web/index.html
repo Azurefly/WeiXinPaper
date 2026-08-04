@@ -5,13 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light" />
   <meta name="theme-color" content="#0f5f64" />
+  <!-- #161 CSP 纵深防御：与服务端响应头保持一致的 Content-Security-Policy -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'" />
+  <!-- #154 CSRF 令牌占位：实际令牌由登录响应下发并写入 csrf_token Cookie，前端 JS 读取后通过 X-CSRF-Token 头回传 -->
+  <meta name="csrf-token" content="" />
   <title>公众号 AI Studio</title>
   <link rel="stylesheet" href="/assets/styles.css" />
 </head>
 <body>
   <div id="route-loading" class="route-loading-bar"></div>
   <div id="app" aria-live="polite"></div>
-  <div id="toast-root" class="toast-root" aria-live="assertive"></div>
+  <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>
   <script type="module" src="/assets/app.js"></script>
 </body>
 </html>

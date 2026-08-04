@@ -13,12 +13,14 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import urllib.robotparser
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Iterable
 from urllib.parse import urljoin, urlsplit
 
 from logger_config import get_logger
+from test_mode import enabled as test_adapter_enabled
 
 logger = get_logger("source_fetcher")
 
@@ -274,7 +276,7 @@ def _request_once(url: str) -> tuple[int, dict[str, str], bytes, str]:
         path += "?" + parsed.query
     last_error: Exception | None = None
     for ip in addresses:
-        conn: http.client.HTTPConnection
+        conn: http.client.HTTPConnection | None = None
         try:
             if parsed.scheme == "https":
                 conn = _PinnedHTTPSConnection(host, ip, port, CONNECT_TIMEOUT)
@@ -317,10 +319,12 @@ def _request_once(url: str) -> tuple[int, dict[str, str], bytes, str]:
         except Exception as exc:  # noqa: BLE001
             last_error = exc
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            # 审计修复: conn 可能未赋值（构造连接对象即抛异常），先判空再关闭
+            if conn:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
     raise SourceFetchError("connect_failed", f"无法连接来源：{last_error}")
 
 
@@ -445,6 +449,82 @@ def _http_fetch(url: str) -> tuple[int, dict[str, str], bytes]:
         return _request_via_proxy(url)
     status, headers, body, _ip = _request_once(url)
     return status, headers, body
+
+
+# ---------------------------------------------------------------------------
+# 审计项 X2: robots.txt 尊重
+#
+# 在抓取目标 URL 之前,先检查目标站点的 robots.txt 是否允许抓取当前路径。
+# 该检查是 best-effort 的:获取 robots.txt 失败(网络错误、DNS 失败、5xx 等)
+# 不会阻塞后续抓取流程。仅当成功获取到 robots.txt 且其中明确 Disallow 当前
+# 路径时,才抛出 SourceFetchError("robots_forbidden") 拒绝抓取。
+# 测试模式下跳过 robots.txt 检查,以保证测试的确定性。
+# ---------------------------------------------------------------------------
+
+
+def _check_robots_txt(url: str) -> None:
+    """审计项 X2: 检查目标站点 robots.txt 是否允许抓取当前路径。
+
+    - 从 URL 提取 scheme 和 host,构造 robots.txt URL
+    - 使用 _http_fetch 获取 robots.txt 内容(失败时跳过,不阻塞流程)
+    - 解析 robots.txt,检查是否 Disallow 当前路径
+    - 如果 Disallow,抛出 SourceFetchError("robots_forbidden")
+    - 解析 Crawl-delay 指令,如果存在则记录到日志
+    - 测试模式下跳过检查
+    """
+    # 测试模式跳过 robots.txt 检查,保证测试确定性
+    if test_adapter_enabled("STUDIO_TEST_AI"):
+        return
+
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return
+
+    # 构造 robots.txt URL(仅使用 scheme + netloc + /robots.txt)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+
+    # best-effort 获取 robots.txt:任何异常都不阻塞抓取流程
+    try:
+        status, headers, body = _http_fetch(robots_url)
+    except SourceFetchError as exc:
+        logger.info("robots.txt 获取失败(%s),跳过检查: %s", exc.code, robots_url)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.info("robots.txt 获取异常,跳过检查: %s", exc)
+        return
+
+    # 非 200 或空响应视为无 robots.txt,跳过检查(允许抓取)
+    if status != 200 or not body:
+        logger.info("robots.txt 返回 HTTP %d,跳过检查: %s", status, robots_url)
+        return
+
+    # 解码 robots.txt 内容
+    try:
+        robots_text = _decode_body(body, headers.get("content-type", "text/plain; charset=utf-8"))
+    except Exception:  # noqa: BLE001
+        robots_text = body.decode("utf-8", errors="replace")
+
+    # 使用标准库 RobotFileParser 解析 robots.txt
+    rp = urllib.robotparser.RobotFileParser()
+    rp.parse(robots_text.splitlines())
+
+    # 检查当前 URL 是否被禁止抓取
+    try:
+        allowed = rp.can_fetch(USER_AGENT, url)
+    except Exception:  # noqa: BLE001
+        logger.info("robots.txt can_fetch 解析异常,跳过检查: %s", robots_url)
+        return
+
+    if not allowed:
+        raise SourceFetchError("robots_forbidden", "来源站点 robots.txt 禁止抓取该路径")
+
+    # 解析 Crawl-delay 指令,记录到日志(仅记录,不实际延迟)
+    try:
+        crawl_delay = rp.crawl_delay(USER_AGENT)
+    except Exception:  # noqa: BLE001
+        crawl_delay = None
+    if crawl_delay is not None:
+        logger.info("robots.txt Crawl-delay=%.1fs (站点: %s)", crawl_delay, parsed.hostname)
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +694,96 @@ def _clean_text(parts: list[str]) -> str:
     return text.strip()
 
 
+# ---------------------------------------------------------------------------
+# 审计项 X4: 来源内容投毒防护(隐藏文本清洗)
+#
+# 攻击者可能在 HTML 中注入对人类不可见但对爬虫/LLM 可见的文本(内容投毒),
+# 例如:HTML 注释中的指令、零宽字符、CSS 隐藏(display:none)的文本、与背景
+# 同色的白色文字、font-size:0/1px 的微小文本等。本函数在正文提取前后对
+# HTML/文本进行清洗,移除这些隐藏内容,防止投毒文本污染来源快照。
+# ---------------------------------------------------------------------------
+
+
+def _clean_hidden_content(html_text: str) -> str:
+    """审计项 X4: 清洗 HTML 中可能的隐藏文本(内容投毒防护)。
+
+    - 去除 HTML 注释中的内容
+    - 去除零宽字符(零宽空格、零宽连字符、方向控制字符等)
+    - 去除 CSS 隐藏的内容(display:none / visibility:hidden 的标签及其内容)
+    - 去除颜色与背景相同的文本(color:#fff / color:white 等)
+    - 去除 font-size 为 0 或 1px 的文本
+    """
+    text = html_text
+
+    # 1. 去除 HTML 注释中的内容
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+    # 2. 去除零宽字符(零宽空格、零宽连字符、方向控制字符、BOM 等)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
+
+    # 3. 去除 CSS 隐藏的内容:匹配 style 属性包含 display:none 或 visibility:hidden
+    #    的标签及其内部内容(非贪婪匹配,简单实现不处理同标签嵌套)
+    _hidden_style_patterns = (
+        r"display\s*:\s*none",
+        r"visibility\s*:\s*hidden",
+    )
+    for pattern in _hidden_style_patterns:
+        # 匹配 <tag ... style="...display:none..."> ... </tag> 并整体移除
+        text = re.sub(
+            r"<(?P<tag>[a-zA-Z][a-zA-Z0-9]*)\b[^>]*"
+            r"style\s*=\s*[\"'][^\"']*\b" + pattern + r"\b[^\"']*[\"']"
+            r"[^>]*>.*?</(?P=tag)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # 匹配无闭合标签的隐藏元素(自闭合或 void 元素)
+        text = re.sub(
+            r"<[a-zA-Z][a-zA-Z0-9]*\b[^>]*"
+            r"style\s*=\s*[\"'][^\"']*\b" + pattern + r"\b[^\"']*[\"']"
+            r"[^>]*/?>",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # 4. 去除颜色与背景相同的文本(白色文字在白色背景上)
+    #    匹配 color:#fff / color:#ffffff / color:white 等
+    _invisible_color_patterns = (
+        r"color\s*:\s*#ffffff\b",
+        r"color\s*:\s*#fff(?![0-9a-fA-F])",
+        r"color\s*:\s*white\b",
+    )
+    for pattern in _invisible_color_patterns:
+        text = re.sub(
+            r"<(?P<tag>[a-zA-Z][a-zA-Z0-9]*)\b[^>]*"
+            r"style\s*=\s*[\"'][^\"']*\b" + pattern + r"[^\"']*[\"']"
+            r"[^>]*>.*?</(?P=tag)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+    # 5. 去除 font-size 为 0 或 1px 的文本(微小不可见文字)
+    #    匹配 font-size:0 / font-size:0px / font-size:1px(排除 10px、100px 等)
+    _tiny_font_patterns = (
+        r"font-size\s*:\s*0px(?![0-9a-zA-Z])",
+        r"font-size\s*:\s*1px(?![0-9a-zA-Z])",
+        r"font-size\s*:\s*0(?![0-9a-zA-Z])",
+    )
+    for pattern in _tiny_font_patterns:
+        text = re.sub(
+            r"<(?P<tag>[a-zA-Z][a-zA-Z0-9]*)\b[^>]*"
+            r"style\s*=\s*[\"'][^\"']*\b" + pattern + r"[^\"']*[\"']"
+            r"[^>]*>.*?</(?P=tag)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+    return text
+
+
 def extract_snapshot(source_url: str, final_url: str, body: bytes, content_type: str) -> SourceSnapshot:
     text = _decode_body(body, content_type)
     if "application/json" in content_type.lower():
@@ -632,11 +802,15 @@ def extract_snapshot(source_url: str, final_url: str, body: bytes, content_type:
             method = "plain_text"
             publisher = author = published = ""
     else:
+        # 审计项 X4: 在 HTML 解析前清洗隐藏文本(内容投毒防护)
+        # 移除 HTML 注释、CSS 隐藏元素、同色文字、微小字体等,防止投毒文本被提取
+        text = _clean_hidden_content(text)
         parser = _Extractor()
         try:
             parser.feed(text)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 审计修复: HTML 解析异常不再静默吞掉，记录告警便于排查投毒/畸形页面
+            logger.warning("HTML 解析失败: %s", exc)
         ld = _pick_json_ld(parser)
         title = str(
             ld.get("headline")
@@ -658,6 +832,16 @@ def extract_snapshot(source_url: str, final_url: str, body: bytes, content_type:
             author = str(author_value.get("name") or "")
         else:
             author = str(author_value or parser.meta.get("author") or "")
+        # 审计项 X2: 解析 meta 标签版权信息,补充 publisher/author 字段
+        # copyright / dcterms.rights → publisher;og:article:author → author
+        if not publisher:
+            publisher = str(
+                parser.meta.get("copyright")
+                or parser.meta.get("dcterms.rights")
+                or ""
+            )
+        if not author:
+            author = str(parser.meta.get("og:article:author") or "")
         published = str(ld.get("datePublished") or parser.meta.get("article:published_time") or "")
         article_body = ld.get("articleBody")
         if isinstance(article_body, str) and len(article_body.strip()) >= 100:
@@ -671,6 +855,9 @@ def extract_snapshot(source_url: str, final_url: str, body: bytes, content_type:
             method = "body_fallback"
     if len(content) < 40:
         raise SourceFetchError("content_empty", "来源没有提取到足够的正文内容")
+    # 审计项 X4: 在 _clean_text 之后对结果进行隐藏文本清洗(内容投毒防护)
+    # 再次清洗可去除经 JSON-LD articleBody 或文本提取后残留的零宽字符等投毒内容
+    content = _clean_hidden_content(content)
     content = content[:200_000]
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
     preview = content[:1200]
@@ -699,6 +886,8 @@ def fetch_source(raw_url: str) -> SourceSnapshot:
             return _fetch_github_tree(original, github)
         if github["kind"] == "blob":
             return _fetch_github_blob(original, github)
+    # 审计项 X2: 在抓取目标 URL 之前,检查 robots.txt 是否允许抓取(测试模式跳过)
+    _check_robots_txt(original)
     resolve = not _has_proxy()
     current = _validate_target(original, resolve=resolve)
     for _ in range(MAX_REDIRECTS + 1):

@@ -15,7 +15,10 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-_BUFFER_SIZE = int(os.environ.get("STUDIO_LOG_BUFFER_SIZE", "2000"))
+try:
+    _BUFFER_SIZE = int(os.environ.get("STUDIO_LOG_BUFFER_SIZE", "2000"))
+except (TypeError, ValueError):
+    _BUFFER_SIZE = 2000
 _LOG_LEVEL = os.environ.get("STUDIO_LOG_LEVEL", "INFO").upper()
 # N2 日志持久化：默认启用文件日志，写入 <项目根>/data/studio.log；
 # 仅当显式设置 STUDIO_LOG_FILE 环境变量时才覆盖默认路径。
@@ -23,12 +26,21 @@ _DEFAULT_LOG_FILE = str(Path(__file__).resolve().parent.parent / "data" / "studi
 _LOG_FILE = os.environ.get("STUDIO_LOG_FILE", "").strip() or _DEFAULT_LOG_FILE
 
 _REDACT_PATTERNS = [
+    # Authorization 允许「Bearer <token>」中间存在空格，需先于通用字段处理。
+    re.compile(
+        r"(?i)([\"']?authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer\s+)?([^\"'\s,}\]]+)"
+    ),
+    # JSON、表单和 key=value 形式的敏感字段。字段名和分隔符保留，值统一替换。
+    re.compile(
+        r"(?i)([\"']?(?:confirmpassword|newpassword|oldpassword|password|api[_-]?key|apikey|"
+        r"app[_-]?secret|appsecret|access_token|csrf_token|csrftoken|session_token)"
+        r"[\"']?\s*[:=]\s*[\"']?)([^\"'\s,}\]]+)"
+    ),
     re.compile(r"(?i)(bearer\s+)(sk-[\w-]+|[\w\-]{20,})", re.ASCII),
     re.compile(r"(?i)(sk-[a-zA-Z0-9]{16,})", re.ASCII),
     re.compile(r"(?i)(api[_-]?key[\s:=]+)([\w\-]{8,})", re.ASCII),
     re.compile(r"(?i)(access_token[\"\s:=]+)([\w\-]+)", re.ASCII),
     re.compile(r"(?i)(app[_-]?secret[\s:=]+)([\w\-]{4})[\w\-]*", re.ASCII),
-    re.compile(r"(?i)(password[\s:=]+)(\S+)", re.ASCII),
 ]
 
 
@@ -41,6 +53,17 @@ def redact_sensitive(text: str) -> str:
         else:
             result = pattern.sub("***REDACTED***", result)
     return result
+
+
+class RedactingFormatter(logging.Formatter):
+    """在任何日志离开进程前统一脱敏。
+
+    脱敏放在 Formatter，而不是仅放在内存 Handler 中，确保 stdout、滚动文件
+    和日志 API 三条输出链路执行完全相同的安全策略。
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive(super().format(record))
 
 
 class _LogEntry:
@@ -87,7 +110,7 @@ class RingBufferHandler(logging.Handler):
             stack = ""
             if record.exc_info and record.exc_info[1] is not None:
                 import traceback
-                stack = "".join(traceback.format_exception(*record.exc_info))
+                stack = redact_sensitive("".join(traceback.format_exception(*record.exc_info)))
             message = self.format(record)
             message = redact_sensitive(message)
             entry = _LogEntry(
@@ -100,7 +123,7 @@ class RingBufferHandler(logging.Handler):
             )
             self._buffer.append(entry)
         except Exception:  # noqa: BLE001
-            pass
+            self.handleError(record)
 
     def query(
         self,
@@ -153,7 +176,7 @@ _task_id_filter = _TaskIdFilter()
 
 _ring_handler = RingBufferHandler(maxlen=_BUFFER_SIZE)
 
-_formatter = logging.Formatter(
+_formatter = RedactingFormatter(
     fmt="[%(asctime)s] [%(levelname)s] [%(name)s] [task:%(task_id)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -186,12 +209,15 @@ try:
     _root.addHandler(_file_handler)
 except PermissionError:
     # 无写入权限时降级，仅保留 stdout + 环形缓冲区
-    pass
+    import logging
+    logging.getLogger("logger_config").warning("日志文件无写入权限，降级为仅 stdout + 环形缓冲区")
 except OSError:
     # 路径不可用等错误时降级
-    pass
+    import logging
+    logging.getLogger("logger_config").warning("日志文件路径不可用，降级为仅 stdout + 环形缓冲区")
 except Exception:  # noqa: BLE001
-    pass
+    import logging
+    logging.getLogger("logger_config").warning("日志文件初始化失败，降级为仅 stdout + 环形缓冲区", exc_info=True)
 
 
 class TaskLoggerAdapter(logging.LoggerAdapter):

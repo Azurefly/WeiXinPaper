@@ -258,9 +258,18 @@ class TokenBucket:
 
 
 # 通过环境变量配置补充速率（令牌/秒），便于按部署环境调优
-_api_rate = float(os.environ.get("STUDIO_WECHAT_API_RATE", "2"))
-_material_rate = float(os.environ.get("STUDIO_WECHAT_MATERIAL_RATE", "0.5"))
-_draft_rate = float(os.environ.get("STUDIO_WECHAT_DRAFT_RATE", "1"))
+# P1-24: 环境变量解析失败时回退到默认值，避免启动崩溃
+def _env_float(name: str, default: float) -> float:
+    """从环境变量读取浮点数，解析失败时回退到默认值。"""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_api_rate = _env_float("STUDIO_WECHAT_API_RATE", 2.0)
+_material_rate = _env_float("STUDIO_WECHAT_MATERIAL_RATE", 0.5)
+_draft_rate = _env_float("STUDIO_WECHAT_DRAFT_RATE", 1.0)
 
 # 全局令牌桶实例：按微信 API 类别分别限流
 # 通用 API 调用：容量 10，补充 2/s（≈120/min）
@@ -451,6 +460,17 @@ def upload_cover_dedup(
     mime = match.group(1)
     raw = base64.b64decode(match.group(2), validate=True)
     if not raw:
+        return ""
+
+    # P1-23: magic bytes 一致性校验，与 server.py 统一
+    _signatures = {
+        "image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+        "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+        "image/webp": len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP",
+    }
+    if not _signatures.get(mime, False):
+        logger.warning("封面实际文件类型与声明不一致（mime=%s），已拒绝上传", mime)
         return ""
 
     # 计算内容 hash

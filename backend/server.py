@@ -5,6 +5,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -18,13 +19,31 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from ai_engine import AIEngine, AIEngineError
+from auth_password import (
+    generate_random_password,
+    hash_password,
+    validate_password_strength,
+    verify_password,
+)
+from auth_session import (
+    SESSION_COOKIE_NAME,
+    build_clear_cookie,
+    build_cookie,
+    cleanup_expired_sessions,
+    create_session,
+    destroy_all_user_sessions,
+    destroy_session,
+    get_session,
+    parse_cookie,
+    update_session_must_change,
+)
 from db import (
     connect,
     count_projects,
@@ -43,20 +62,23 @@ from db import (
     settings_bundle,
     utc_now,
 )
+from data_transfer import export_data, import_data
 from logger_config import get_logger, query_logs
 from runtime_security import validate_runtime_security
 from secure_http import SecureHttpError, request_bytes
 from test_mode import enabled as test_adapter_enabled
-from source_fetcher import fetch_source
+from source_fetcher import SourceFetchError, fetch_source
 from wechat_api import (
     WeChatApiError,
     _token_manager as _wechat_token_manager,
     create_draft as _wechat_create_draft,
     upload_cover_dedup as _wechat_upload_cover_dedup,
+    wechat_api_call as _wechat_api_call,
 )
 from workflow import cancel_workflow, create_workflow, mark_interrupted_tasks, retry_workflow
 
 access_logger = get_logger("access")
+logger = get_logger("server")
 
 # PyInstaller 打包后，资源在 sys._MEIPASS 临时目录中
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -66,6 +88,31 @@ else:
 WEB_ROOT = ROOT / "web"
 VERSION = "2.1.3"
 MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+
+# #154 CSRF 防护：双重提交 Cookie 模式
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+
+
+def _generate_csrf_token() -> str:
+    """生成 CSRF 令牌（URL 安全的随机串）。"""
+    return secrets.token_urlsafe(32)
+
+
+def _build_csrf_cookie(token: str) -> str:
+    """构建 csrf_token 的 Set-Cookie 头值。
+
+    注意：不设置 HttpOnly —— 前端 JS 需读取该 Cookie 后通过 X-CSRF-Token 头回传，
+    与 Cookie 中的值做双重提交校验。SameSite=Strict 阻止跨站自动携带。
+    """
+    secure = "; Secure" if os.environ.get("STUDIO_PUBLIC_ORIGIN", "").strip().lower().startswith("https://") else ""
+    return f"{CSRF_COOKIE_NAME}={token}; Path=/; Max-Age=28800; SameSite=Strict{secure}"
+
+
+def _build_clear_csrf_cookie() -> str:
+    """构建清除 csrf_token 的 Set-Cookie 头值。"""
+    secure = "; Secure" if os.environ.get("STUDIO_PUBLIC_ORIGIN", "").strip().lower().startswith("https://") else ""
+    return f"{CSRF_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Strict{secure}"
 
 
 class ApiProblem(RuntimeError):
@@ -78,6 +125,14 @@ class ApiProblem(RuntimeError):
 
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _env_int(name: str, default: int) -> int:
+    # P1-24: 安全读取环境变量整数，转换失败时返回默认值
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _mask_settings(bundle: dict[str, Any]) -> dict[str, Any]:
@@ -300,9 +355,22 @@ def _test_ai_connectivity(base_url: str, api_key: str) -> dict[str, Any]:
         )
         return {"ok": True, "message": f"模型服务连接成功（HTTP {response.status}）"}
     except SecureHttpError as exc:
-        if exc.status is not None and 300 <= exc.status < 500:
-            return {"ok": True, "message": f"模型服务可达（HTTP {exc.status}）"}
-        raise ApiProblem(400, "ai_verify_failed", f"无法安全连接模型服务（{exc.code}）") from exc
+        status = exc.status
+        # #141 返回结构化错误码，便于前端区分失败原因
+        if status is not None and 300 <= status < 500:
+            if status in (401, 403):
+                raise ApiProblem(400, "invalid_key", "API Key 无效或无权限访问模型服务") from exc
+            if status == 404:
+                raise ApiProblem(400, "model_not_found", "模型服务未找到指定资源，请检查 Base URL 或模型名称") from exc
+            if status == 429:
+                raise ApiProblem(400, "quota_exceeded", "模型服务请求配额已用尽，请稍后重试或更换 API Key") from exc
+            # 其余 3xx/4xx 表示服务可达（如 301、400），仅记录但不判定为失败
+            return {"ok": True, "message": f"模型服务可达（HTTP {status}）"}
+        if status is None:
+            # 连接/解析类错误（DNS 失败、连接超时、SSL 错误等）
+            raise ApiProblem(400, "network_error", f"无法连接模型服务（{exc.code}），请检查网络或 Base URL") from exc
+        # 5xx 等服务端错误
+        raise ApiProblem(400, "network_error", f"模型服务返回 HTTP {status}，暂时不可用") from exc
 
 def _verify_ai(config: dict[str, Any]) -> dict[str, Any]:
     if not bool(get_setting("general").get("allowNetwork", True)) and not _test_adapter_enabled("STUDIO_TEST_AI"):
@@ -406,7 +474,8 @@ def _publish_snapshot(project: dict[str, Any], request: dict[str, Any]) -> dict[
     actual_fingerprint = _body_fingerprint(current["bodyMarkdown"])
     if not fingerprint or not hmac.compare_digest(fingerprint, actual_fingerprint):
         raise ApiProblem(409, "publish_fingerprint_mismatch", "发布正文指纹与服务端不一致")
-    content_html = _markdown_to_wechat_html(current["bodyMarkdown"])
+    # #188 发布内容同样经过服务端消毒，与预览端点保持一致的 previewHash
+    content_html = _render_wechat_html(current["bodyMarkdown"])
     actual_preview_hash = hashlib.sha256(content_html.encode("utf-8")).hexdigest()
     if not preview_hash or not hmac.compare_digest(preview_hash, actual_preview_hash):
         raise ApiProblem(409, "publish_preview_stale", "发布预览已过期，请重新预览")
@@ -415,6 +484,14 @@ def _publish_snapshot(project: dict[str, Any], request: dict[str, Any]) -> dict[
     if current["reviewRevision"] != revision or current["reviewFingerprint"] != actual_fingerprint:
         raise ApiProblem(409, "review_stale", "正文或版本已变化，请重新完成人工终审")
     _validate_publish_content(current, content_html)
+    # P1-15: 设置 revision 占位，防止并发发布产生多个微信草稿
+    with connect() as conn:
+        cursor = conn.execute(
+            "UPDATE projects SET publish_status='syncing', updated_at=? WHERE id=? AND revision=? AND publish_status != 'synced'",
+            (utc_now(), current["id"], revision),
+        )
+        if cursor.rowcount != 1:
+            raise ApiProblem(409, "publish_in_progress", "文章正在发布中或版本已变化，请刷新后重试")
     return {
         "projectId": current["id"],
         "revision": revision,
@@ -475,40 +552,64 @@ def _wechat_publish(project: dict[str, Any], request: dict[str, Any]) -> dict[st
         response_payload = {"media_id": remote_id}
 
     now = utc_now()
-    with connect() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE projects SET publish_status='synced',publish_remote_id=?,published_revision=?,
-                publish_fingerprint=?,publish_preview_hash=?,updated_at=?
-            WHERE id=? AND revision=?
-            """,
-            (
-                remote_id,
-                snapshot["revision"],
-                snapshot["bodyFingerprint"],
-                snapshot["previewHash"],
-                now,
-                snapshot["projectId"],
-                snapshot["revision"],
-            ),
-        )
-        receipt_status = "current" if cursor.rowcount == 1 else "stale"
-        conn.execute(
-            """
-            INSERT INTO publish_receipts(project_id,revision,body_fingerprint,preview_hash,remote_id,status,response_json,created_at)
-            VALUES(?,?,?,?,?,?,?,?)
-            """,
-            (
-                snapshot["projectId"],
-                snapshot["revision"],
-                snapshot["bodyFingerprint"],
-                snapshot["previewHash"],
-                remote_id,
-                receipt_status,
-                json.dumps(response_payload, ensure_ascii=False),
-                now,
-            ),
-        )
+    try:
+        with connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE projects SET publish_status='synced',publish_remote_id=?,published_revision=?,
+                    publish_fingerprint=?,publish_preview_hash=?,updated_at=?
+                WHERE id=? AND revision=?
+                """,
+                (
+                    remote_id,
+                    snapshot["revision"],
+                    snapshot["bodyFingerprint"],
+                    snapshot["previewHash"],
+                    now,
+                    snapshot["projectId"],
+                    snapshot["revision"],
+                ),
+            )
+            receipt_status = "current" if cursor.rowcount == 1 else "stale"
+            conn.execute(
+                """
+                INSERT INTO publish_receipts(project_id,revision,body_fingerprint,preview_hash,remote_id,status,response_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    snapshot["projectId"],
+                    snapshot["revision"],
+                    snapshot["bodyFingerprint"],
+                    snapshot["previewHash"],
+                    remote_id,
+                    receipt_status,
+                    json.dumps(response_payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+    except Exception as db_exc:
+        # P0-2: DB写入失败，尝试补偿删除微信侧草稿
+        logger.error("发布DB写入失败，尝试补偿删除微信草稿: %s", db_exc)
+        if not _test_adapter_enabled("STUDIO_TEST_WECHAT"):
+            try:
+                _wechat_api_call(
+                    "https://api.weixin.qq.com/cgi-bin/draft/delete?access_token="
+                    + urllib.parse.quote(token),
+                    method="POST",
+                    body=json.dumps(
+                        {"media_id": remote_id}, ensure_ascii=False
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Accept": "application/json",
+                    },
+                    app_id=app_id,
+                    app_secret=secret,
+                )
+                logger.info("补偿删除微信草稿成功: %s", remote_id)
+            except Exception as comp_exc:
+                logger.error("补偿删除微信草稿也失败: %s", comp_exc)
+        raise ApiProblem(500, "publish_db_failed", f"发布记录写入失败，已尝试补偿删除微信草稿: {db_exc}") from db_exc
     return {
         "remoteId": remote_id,
         "syncedAt": now,
@@ -532,13 +633,26 @@ def _markdown_to_wechat_html(markdown: str) -> str:
             .replace("'", "&#39;")
         )
 
+    def safe_url(url: str) -> str:
+        """P1-10: 仅允许 http/https/data:image 协议的 URL。"""
+        url = url.strip()
+        if url.startswith(("http://", "https://", "data:image/")):
+            return url
+        if url.startswith("#") or url.startswith("/"):
+            return url  # 锚点和相对路径允许
+        return ""  # 其他协议（javascript:等）拒绝
+
     def inline(text: str) -> str:
         escaped = escape_text(text)
         escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
         escaped = re.sub(
             r"\[([^]]+)]\((https://[^)\s]+)\)",
-            lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
+            lambda m: (
+                f'<a href="{safe_url(m.group(2))}">{m.group(1)}</a>'
+                if safe_url(m.group(2))
+                else m.group(1)
+            ),
             escaped,
         )
         return escaped
@@ -579,11 +693,18 @@ def _markdown_to_wechat_html(markdown: str) -> str:
         if img_match:
             close_list()
             alt = escape_text(img_match.group(1))
-            src = escape_text(img_match.group(2))
-            if img_match.group(2) == "placeholder":
+            raw_src = img_match.group(2)
+            if raw_src == "placeholder":
                 output.append(f'<p class="img-suggestion">📷 {alt}</p>')
             else:
-                output.append(f'<p><img src="{src}" alt="{alt}" /></p>')
+                # P1-10: 校验图片 URL 协议白名单
+                safe_src = safe_url(raw_src)
+                if not safe_src:
+                    # 非法协议（javascript: 等），渲染为占位建议
+                    output.append(f'<p class="img-suggestion">📷 {alt}</p>')
+                else:
+                    src = escape_text(safe_src)
+                    output.append(f'<p><img src="{src}" alt="{alt}" /></p>')
             continue
         ordered = re.match(r"^(\d+)\.\s+(.+)$", stripped)
         if stripped.startswith(("- ", "* ")) or ordered:
@@ -613,6 +734,119 @@ def _markdown_to_wechat_html(markdown: str) -> str:
     return "".join(output)
 
 
+def _sanitize_preview_html(html: str) -> str:
+    """#188 服务端预览 HTML 消毒：移除危险标签与属性，防御 XSS。
+
+    _markdown_to_wechat_html 已对文本做转义并校验 URL 协议白名单，此处作为
+    纵深防御层，剥离 <script>/<iframe> 等危险标签、on* 事件属性与
+    javascript:/vbscript: 协议，确保发送给客户端的预览 HTML 安全。
+    """
+    # 移除完整的危险标签块（script/iframe/object/embed/svg/math）
+    html = re.sub(r"(?is)<\s*(script|iframe|object|embed|svg|math)\b[^>]*>.*?<\s*/\s*\1\s*>", "", html)
+    # 移除自闭合或未闭合的危险标签
+    html = re.sub(r"(?is)<\s*/?\s*(script|iframe|object|embed)\b[^>]*>", "", html)
+    # 移除所有 on* 事件处理器属性（onclick、onerror 等）
+    html = re.sub(r"(?i)\s+on[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", html)
+    # 将 javascript:/vbscript: 协议的 href/src 置空
+    html = re.sub(
+        r"(?i)(href|src)\s*=\s*(\"javascript:[^\"]*\"|'javascript:[^']*'|javascript:[^\s>]+)",
+        lambda m: m.group(1) + '=""',
+        html,
+    )
+    html = re.sub(
+        r"(?i)(href|src)\s*=\s*(\"vbscript:[^\"]*\"|'vbscript:[^']*'|vbscript:[^\s>]+)",
+        lambda m: m.group(1) + '=""',
+        html,
+    )
+    return html
+
+
+def _render_wechat_html(markdown: str) -> str:
+    """渲染 Markdown 为微信公众号 HTML，并做服务端消毒。
+
+    #188 预览端点与发布流程统一使用本函数，保证 previewHash 一致，
+    且发布到微信的内容同样经过服务端消毒。
+    """
+    return _sanitize_preview_html(_markdown_to_wechat_html(markdown))
+
+
+def _check_published_stale_status() -> list[dict[str, Any]]:
+    """#068 检查已发布文章的远程草稿是否已过期（stale）。
+
+    检测 publish_status='synced' 但 published_revision 与当前 revision 不一致
+    （即发布后被编辑）的文章，返回需要提醒的项目列表，供 SSE 轮询时推送。
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, revision, published_revision, publish_remote_id
+            FROM projects
+            WHERE deleted=0 AND publish_status='synced' AND published_revision != revision
+            ORDER BY updated_at DESC LIMIT 50
+            """
+        ).fetchall()
+    return [
+        {
+            "projectId": row["id"],
+            "title": row["title"],
+            "currentRevision": int(row["revision"]),
+            "publishedRevision": int(row["published_revision"]),
+            "remoteId": row["publish_remote_id"],
+        }
+        for row in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 用户认证：初始用户创建
+# ---------------------------------------------------------------------------
+
+INITIAL_USERNAME = "admin"
+INITIAL_PASSWORD_FILE = ".initial_password"
+
+
+def ensure_initial_user() -> str | None:
+    """确保数据库中存在初始管理员用户。
+
+    如果 users 表为空，创建 admin 用户并生成随机初始密码。
+    密码写入 data/.initial_password 文件并输出到控制台。
+    返回初始密码（仅首次创建时），否则返回 None。
+    """
+    with connect() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if count > 0:
+            return None
+
+        password = generate_random_password(16)
+        password_hash = hash_password(password)
+        now = utc_now()
+        user_id = "usr_" + uuid.uuid4().hex[:20]
+        conn.execute(
+            "INSERT INTO users(id, username, password_hash, must_change_password, is_active, created_at, updated_at) "
+            "VALUES(?,?,?,?,1,?,?)",
+            (user_id, INITIAL_USERNAME, password_hash, 1, now, now),
+        )
+
+    # 写入初始密码文件（供桌面端读取显示）
+    try:
+        from db import db_path
+
+        password_file = db_path().parent / INITIAL_PASSWORD_FILE
+        password_file.write_text(password, encoding="utf-8")
+        os.chmod(password_file, 0o600)
+    except OSError:
+        pass
+
+    # 输出到控制台
+    print("=" * 60)
+    print("初始管理员账户已创建")
+    print(f"  用户名: {INITIAL_USERNAME}")
+    print(f"  初始密码: {password}")
+    print("  首次登录后必须修改密码")
+    print("=" * 60)
+
+    access_logger.info("初始管理员用户 %s 已创建，初始密码已生成", INITIAL_USERNAME)
+    return password
 
 
 class StudioHandler(BaseHTTPRequestHandler):
@@ -641,12 +875,22 @@ class StudioHandler(BaseHTTPRequestHandler):
             # X-Forwarded-For 可能包含多个 IP: client, proxy1, proxy2
             # 取第一个（最原始的客户端 IP）
             first_ip = xff.split(",")[0].strip()
+            # P1-8: 校验 XFF 值的 IP 格式，拒绝非法值
             if first_ip:
-                return first_ip
+                try:
+                    ipaddress.ip_address(first_ip)
+                    return first_ip
+                except ValueError:
+                    pass  # Invalid IP format, fall through
         # 回退到 X-Real-IP
         xri = self.headers.get("X-Real-IP", "").strip()
         if xri:
-            return xri
+            # P1-8: 同样校验 X-Real-IP 的格式
+            try:
+                ipaddress.ip_address(xri)
+                return xri
+            except ValueError:
+                pass  # Invalid IP format, fall through
         return direct_ip
 
     def _check_rate_limit(self) -> None:
@@ -655,12 +899,62 @@ class StudioHandler(BaseHTTPRequestHandler):
         now = time.monotonic()
         key = self._get_client_ip()
         with self._rate_lock:
+            # P1-8: 限制 _rate_windows 字典大小，防止内存增长
+            if len(self._rate_windows) > 10000:
+                # 清理空窗口
+                stale_keys = [k for k, v in self._rate_windows.items() if not v]
+                for k in stale_keys:
+                    del self._rate_windows[k]
             window = self._rate_windows.setdefault(key, collections.deque())
             while window and now - window[0] > 60:
                 window.popleft()
             if len(window) >= 120:
                 raise ApiProblem(429, "rate_limited", "写操作过于频繁，请稍后重试")
             window.append(now)
+
+    def _check_login_rate_limit(self) -> None:
+        """登录限流：每 IP 每分钟最多 5 次尝试。
+
+        S3 审计修复：将登录尝试计数从内存 dict 改为数据库持久化，
+        进程重启后仍能保持限流状态，防止通过重启绕过限流。
+        """
+        ip = self._get_client_ip()
+        now = utc_now()
+        # 计算最近 1 分钟的时间边界
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=60)).replace(
+            microsecond=0
+        ).isoformat()
+        with connect() as conn:
+            # 顺便清理过期记录，避免表无限增长
+            conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (cutoff,))
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM login_attempts WHERE ip=? AND attempted_at >= ?",
+                (ip, cutoff),
+            ).fetchone()
+            count = int(row["cnt"]) if row else 0
+            if count >= 5:
+                raise ApiProblem(429, "too_many_attempts", "登录尝试过于频繁，请稍后再试")
+            conn.execute(
+                "INSERT INTO login_attempts(ip, attempted_at) VALUES(?, ?)",
+                (ip, now),
+            )
+
+    def _get_session_token(self) -> str | None:
+        """从 Cookie 头中解析会话令牌。"""
+        cookie_header = self.headers.get("Cookie", "")
+        return parse_cookie(cookie_header, SESSION_COOKIE_NAME)
+
+    def _require_session(self) -> dict[str, Any] | None:
+        """验证会话，返回会话信息或发送 401 并返回 None。"""
+        token = self._get_session_token()
+        if not token:
+            self._send_json(401, {"error": {"code": "unauthenticated", "message": "请先登录"}})
+            return None
+        session = get_session(token)
+        if not session:
+            self._send_json(401, {"error": {"code": "session_expired", "message": "会话已过期，请重新登录"}})
+            return None
+        return session
 
     def log_message(self, fmt: str, *args: Any) -> None:
         """禁用 BaseHTTPRequestHandler 默认日志，访问日志由 _log_access 统一记录。"""
@@ -673,34 +967,14 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            # #161 CSP：合并审计要求的指令与既有的安全收紧指令。
+            # 包含 font-src 'self' data: 与 style-src 'self' 'unsafe-inline'，
+            # 同时保留 frame-ancestors/base-uri/form-action 收紧策略。
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
         )
         self.send_header("Cache-Control", "no-store" if self.path.startswith("/api/") else "no-cache")
-
-    def _authenticate(self) -> bool:
-        username = os.environ.get("STUDIO_AUTH_USER", "")
-        password = os.environ.get("STUDIO_AUTH_PASSWORD", "")
-        if not username and not password:
-            return True
-        header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="WeiXinGZH Studio"')
-            self._security_headers()
-            self.end_headers()
-            return False
-        try:
-            decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
-            supplied_user, supplied_password = decoded.split(":", 1)
-        except Exception:
-            supplied_user = supplied_password = ""
-        if not (hmac.compare_digest(supplied_user, username) and hmac.compare_digest(supplied_password, password)):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="WeiXinGZH Studio"')
-            self._security_headers()
-            self.end_headers()
-            return False
-        return True
 
     def _check_origin(self) -> None:
         if self.command not in MUTATING:
@@ -725,19 +999,49 @@ class StudioHandler(BaseHTTPRequestHandler):
         if origin.rstrip("/") not in allowed_origins:
             raise ApiProblem(403,"origin_forbidden","请求来源不被允许")
 
-    def _send_json(self, status: int, value: Any) -> None:
+    def _check_csrf(self) -> None:
+        """#154 双重提交 Cookie 模式的 CSRF 校验。
+
+        对写操作（POST/PUT/PATCH/DELETE）校验 Cookie 中的 csrf_token 与
+        X-CSRF-Token 请求头是否一致。登录端点豁免（首次签发令牌）。
+
+        未携带 csrf_token Cookie 的客户端（如非浏览器脚本、测试客户端）不强制
+        校验，此类请求依赖 _check_origin 的 Origin 校验与 SameSite=Strict
+        会话 Cookie 提供防护；浏览器登录后会自动携带该 Cookie，因此必须回传
+        匹配的 X-CSRF-Token 头，攻击者无法跨站读取 Cookie 值故无法伪造。
+        """
+        if self.command not in MUTATING:
+            return
+        request_path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+        # 登录端点豁免：CSRF 令牌在此首次签发
+        if request_path == "/api/v2/auth/login":
+            return
+        cookie_token = parse_cookie(self.headers.get("Cookie", ""), CSRF_COOKIE_NAME)
+        if not cookie_token:
+            # 客户端未参与 CSRF 令牌流程，回退到 Origin + SameSite 防护
+            return
+        header_token = self.headers.get(CSRF_HEADER_NAME, "").strip()
+        if not header_token:
+            raise ApiProblem(403, "csrf_token_missing", "缺少 CSRF 令牌")
+        if not hmac.compare_digest(cookie_token, header_token):
+            raise ApiProblem(403, "csrf_token_mismatch", "CSRF 令牌校验失败")
+
+    def _send_json(self, status: int, value: Any, *, extra_headers: dict[str, str] | None = None, set_cookies: list[str] | None = None) -> None:
         body = _json_bytes(value)
-        # 捕获响应摘要用于访问日志
-        try:
-            resp_str = body.decode("utf-8", errors="replace")
-            self._resp_status = status
-            self._resp_preview = resp_str[:500] if len(resp_str) > 500 else resp_str
-        except Exception:  # noqa: BLE001
-            self._resp_status = status
-            self._resp_preview = "<binary>"
+        # 访问日志只记录字节数，绝不复制响应正文。响应中可能包含文章、来源、
+        # CSRF 令牌或第三方返回信息，截断后记录仍会造成隐私和凭证泄漏。
+        self._resp_status = status
+        self._resp_bytes = len(body)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
+        # #154 支持同时下发多个 Set-Cookie（如会话 Cookie 与 csrf_token Cookie）
+        if set_cookies:
+            for cookie in set_cookies:
+                self.send_header("Set-Cookie", cookie)
         self._security_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -751,12 +1055,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if length < 0 or length > max_bytes:
             raise ApiProblem(413, "payload_too_large", "请求内容过大")
         raw = self.rfile.read(length) if length else b"{}"
-        # 捕获请求体摘要用于访问日志
-        try:
-            req_str = raw.decode("utf-8", errors="replace")
-            self._req_preview = req_str[:500] if len(req_str) > 500 else req_str
-        except Exception:  # noqa: BLE001
-            self._req_preview = "<binary>"
+        # 只记录大小，不记录原始请求体。登录密码、AI Key、微信 AppSecret 和文章
+        # 正文都可能出现在这里，不能依赖事后正则脱敏来兜底。
+        self._req_bytes = len(raw)
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -765,16 +1066,26 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise ApiProblem(400, "invalid_json", "请求 JSON 必须是对象")
         return value
 
+    # 不需要会话认证的 API 端点
+    _PUBLIC_API_PATHS = {
+        "/api/v2/auth/login",
+        "/api/v2/auth/session",
+    }
+    # 需要会话但不需要修改密码的端点
+    _PRE_PASSWORD_CHANGE_PATHS = {
+        "/api/v2/auth/logout",
+        "/api/v2/auth/change-password",
+    }
+
     def _handle(self) -> None:
-        if not self._authenticate():
-            return
         _req_start = time.monotonic()
         # 初始化请求/响应摘要
-        self._req_preview = ""
+        self._req_bytes = 0
         self._resp_status = 0
-        self._resp_preview = ""
+        self._resp_bytes = 0
         try:
             self._check_origin()
+            self._check_csrf()
             self._check_rate_limit()
             if self.path.startswith("/api/"):
                 self._route_api()
@@ -787,7 +1098,8 @@ class StudioHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"error": {"code": "invalid_request", "message": str(exc)}})
         except Exception as exc:  # noqa: BLE001
-            self._send_json(500, {"error": {"code": "internal_error", "message": "服务器发生未预期错误", "detail": repr(exc)}})
+            # 内部异常细节只进入已脱敏服务端日志，不回传文件路径、SQL 或对象 repr。
+            self._send_json(500, {"error": {"code": "internal_error", "message": "服务器发生未预期错误"}})
             access_logger.error("%s %s %s -> 500 internal_error (%.0fms): %s", self.address_string(), self.command, self.path, (time.monotonic() - _req_start) * 1000, exc, exc_info=exc)
         finally:
             # 仅对 API 请求记录结构化访问日志
@@ -795,28 +1107,29 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self._log_access(_req_start)
 
     def _log_access(self, req_start: float) -> None:
-        """记录包含请求参数和响应摘要的结构化访问日志。"""
+        """记录最小化访问日志，不记录正文、凭证或查询值。"""
         duration_ms = (time.monotonic() - req_start) * 1000
         status = self._resp_status or 0
         # 解析路径和查询参数
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
-        query_str = parsed.query
+        # 高频探针和日志查询不再制造新的访问日志，避免日志页面自我放大。
+        if path in {"/api/v2/health", "/api/v2/logs", "/api/v2/tasks/events/stream"}:
+            return
+        query_keys = sorted(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
 
         # 构建日志消息：方法 路径 -> 状态码 (耗时)
-        # 请求参数：query string + 请求体摘要
-        # 响应摘要：响应体前 500 字符
         parts = [
             f'{self.command} {path}',
             f'-> {status}' if status else '-> (no response)',
             f'({duration_ms:.0f}ms)',
         ]
-        if query_str:
-            parts.append(f'query=[{query_str}]')
-        if self._req_preview:
-            parts.append(f'req_body={self._req_preview}')
-        if self._resp_preview:
-            parts.append(f'resp_body={self._resp_preview}')
+        if query_keys:
+            parts.append(f'query_keys={query_keys}')
+        if self._req_bytes:
+            parts.append(f'req_bytes={self._req_bytes}')
+        if self._resp_bytes:
+            parts.append(f'resp_bytes={self._resp_bytes}')
 
         msg = ' '.join(parts)
         if status >= 500:
@@ -835,6 +1148,13 @@ class StudioHandler(BaseHTTPRequestHandler):
         segments = [part for part in path.split("/") if part]
         query = urllib.parse.parse_qs(parsed.query)
 
+        # --- 认证端点（无需会话） ---
+        if path == "/api/v2/auth/login" and method == "POST":
+            self._handle_login()
+            return
+        if path == "/api/v2/auth/session" and method == "GET":
+            self._handle_session_info()
+            return
         if path == "/api/v2/health" and method == "GET":
             ai = get_setting("ai")
             wechat = get_setting("wechat")
@@ -855,6 +1175,26 @@ class StudioHandler(BaseHTTPRequestHandler):
                     "wechatConfigured": wechat_configured,
                     "networkAllowed": bool(get_setting("general").get("allowNetwork", True)),
                 },
+            )
+            return
+
+        # --- 以下端点需要会话认证 ---
+        session = self._require_session()
+        if not session:
+            return
+
+        if path == "/api/v2/auth/logout" and method == "POST":
+            self._handle_logout()
+            return
+        if path == "/api/v2/auth/change-password" and method == "POST":
+            self._handle_change_password(session)
+            return
+
+        # 首次登录必须先修改密码
+        if session.get("must_change_password"):
+            self._send_json(
+                403,
+                {"error": {"code": "password_change_required", "message": "请先修改初始密码"}},
             )
             return
 
@@ -886,6 +1226,28 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._send_json(202, result)
             return
 
+        # U3 审计修复：工作流创建前的来源预览（不创建项目/任务）
+        if path == "/api/v2/source/preview" and method == "POST":
+            body = self._read_json()
+            url = str(body.get("url") or "").strip()
+            if not url:
+                raise ApiProblem(400, "invalid_request", "缺少 url 参数")
+            try:
+                snapshot = fetch_source(url)
+            except SourceFetchError as exc:
+                raise ApiProblem(400, "source_fetch_failed", str(exc)) from exc
+            self._send_json(
+                200,
+                {
+                    "title": snapshot.title,
+                    "preview": snapshot.preview,
+                    "contentHash": snapshot.content_hash,
+                    "publisher": snapshot.publisher,
+                    "author": snapshot.author,
+                },
+            )
+            return
+
         if path == "/api/v2/tasks" and method == "GET":
             limit = int(query.get("limit", ["100"])[0])
             offset = int(query.get("offset", ["0"])[0])
@@ -914,6 +1276,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"total": len(logs), "logs": logs})
             return
 
+        # P2 审计修复：SSE 实时推送活跃任务状态（必须在 tasks/{id} 路由之前匹配）
+        if path == "/api/v2/tasks/events/stream" and method == "GET":
+            # #186 SSE 端点需校验会话，会话过期则返回 401
+            self._handle_sse_stream(self._get_session_token())
+            return
+
         if len(segments) >= 4 and segments[:3] == ["api", "v2", "tasks"]:
             task_id = segments[3]
             if len(segments) == 4 and method == "GET":
@@ -939,6 +1307,19 @@ class StudioHandler(BaseHTTPRequestHandler):
             if len(segments) == 5 and segments[4] == "retry" and method == "POST":
                 body = self._read_json()
                 self._send_json(202, retry_workflow(task_id, str(body.get("retryMode") or "review_only")))
+                return
+            # R1-resume 审计修复：恢复因服务重启中断的失败任务
+            if len(segments) == 5 and segments[4] == "resume" and method == "POST":
+                task = get_task(task_id)
+                if not task:
+                    raise KeyError("任务不存在")
+                if task["status"] != "failed" or task["errorCode"] != "server_restarted":
+                    raise ApiProblem(
+                        409, "resume_not_allowed",
+                        "仅因服务重启导致失败（error_code=server_restarted）的任务可以恢复",
+                    )
+                result = retry_workflow(task_id, retry_mode="full")
+                self._send_json(202, result)
                 return
 
         if path == "/api/v2/projects" and method == "GET":
@@ -982,6 +1363,40 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise ApiProblem(410, "workflow_required", "新文章只能通过统一创作入口创建")
         if path == "/api/v2/generation/jobs" and method == "POST":
             raise ApiProblem(410, "workflow_required", "旧生成接口已停用，请使用 /api/v2/workflows")
+
+        # U4 审计修复：批量操作（归档/删除/恢复）
+        if path == "/api/v2/projects/batch" and method == "POST":
+            body = self._read_json()
+            action = str(body.get("action") or "")
+            ids = body.get("ids")
+            if action not in ("archive", "delete", "restore"):
+                raise ApiProblem(400, "invalid_action", "action 必须是 archive、delete 或 restore")
+            if not isinstance(ids, list) or not ids:
+                raise ApiProblem(400, "invalid_request", "ids 必须是非空数组")
+            if len(ids) > 100:
+                raise ApiProblem(400, "too_many_ids", "单次最多操作 100 个 ID")
+            normalized_ids = [str(i) for i in ids if isinstance(i, str) and i.strip()]
+            if not normalized_ids:
+                raise ApiProblem(400, "invalid_request", "ids 不能为空")
+            now = utc_now()
+            # #189 逐项执行批量操作，记录失败项及原因，供前端展示哪些项目失败
+            sql_map = {
+                "archive": "UPDATE projects SET archived=1,revision=revision+1,updated_at=? WHERE id=? AND deleted=0",
+                "delete": "UPDATE projects SET deleted=1,revision=revision+1,updated_at=? WHERE id=?",
+                "restore": "UPDATE projects SET deleted=0,archived=0,revision=revision+1,updated_at=? WHERE id=?",
+            }
+            sql = sql_map[action]
+            updated = 0
+            failed: list[dict[str, str]] = []
+            with connect() as conn:
+                for project_id in normalized_ids:
+                    cursor = conn.execute(sql, (now, project_id))
+                    if cursor.rowcount == 1:
+                        updated += 1
+                    else:
+                        failed.append({"id": project_id, "reason": "文章不存在或不满足操作条件"})
+            self._send_json(200, {"updated": updated, "failed": failed})
+            return
 
         if len(segments) >= 4 and segments[:3] == ["api", "v2", "projects"]:
             project_id = segments[3]
@@ -1062,12 +1477,21 @@ class StudioHandler(BaseHTTPRequestHandler):
             if action == "sources" and method == "GET":
                 self._send_json(200, {"items": _project_sources(project_id)})
                 return
+            # #169 独立封面上传端点，避免大体积 base64 封面导致 PATCH 超时
+            if action == "cover" and method == "POST":
+                self._upload_cover(project)
+                return
+            # #125 AI 摘要生成端点
+            if action == "summarize" and method == "POST":
+                self._generate_summary(project)
+                return
             if action == "refresh-source" and method == "POST":
                 self._require_current_revision(project)
                 self._refresh_source(project)
                 return
             if action == "preview" and method == "GET":
-                html = _markdown_to_wechat_html(project["bodyMarkdown"])
+                # #188 预览 HTML 经服务端消毒后再返回，并显式声明 JSON Content-Type
+                html = _render_wechat_html(project["bodyMarkdown"])
                 self._send_json(
                     200,
                     {
@@ -1108,6 +1532,75 @@ class StudioHandler(BaseHTTPRequestHandler):
             if action == "publish" and method == "POST":
                 self._send_json(200, _wechat_publish(project, self._read_json()))
                 return
+            # D1 审计修复：并发发布 stale 状态处理端点
+            if (
+                len(segments) == 6
+                and segments[4] == "publish"
+                and segments[5] == "confirm-sync"
+                and method == "POST"
+            ):
+                body = self._read_json()
+                revision = body.get("revision")
+                if type(revision) is not int:
+                    raise ApiProblem(400, "revision_required", "必须携带 revision")
+                with connect() as conn:
+                    cursor = conn.execute(
+                        "UPDATE projects SET publish_status='synced',updated_at=? "
+                        "WHERE id=? AND revision=?",
+                        (utc_now(), project_id, revision),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ApiProblem(409, "revision_conflict", "文章版本已变化，无法确认同步")
+                self._send_json(200, get_project(project_id, include_deleted=True))
+                return
+            if (
+                len(segments) == 6
+                and segments[4] == "publish"
+                and segments[5] == "delete-remote"
+                and method == "POST"
+            ):
+                body = self._read_json()
+                remote_id = str(body.get("remoteId") or "").strip()
+                if not remote_id:
+                    raise ApiProblem(400, "invalid_request", "缺少 remoteId")
+                deleted = False
+                message = "远程草稿未删除"
+                settings = get_setting("wechat")
+                app_id = str(settings.get("appId") or "")
+                secret = str(settings.get("appSecret") or "")
+                if app_id and secret:
+                    try:
+                        token = _wechat_token(app_id, secret)
+                        _wechat_api_call(
+                            "https://api.weixin.qq.com/cgi-bin/draft/delete?access_token="
+                            + urllib.parse.quote(token),
+                            method="POST",
+                            body=json.dumps(
+                                {"media_id": remote_id}, ensure_ascii=False
+                            ).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json; charset=utf-8",
+                                "Accept": "application/json",
+                            },
+                            app_id=app_id,
+                            app_secret=secret,
+                        )
+                        deleted = True
+                        message = "远程草稿已删除"
+                    except (WeChatApiError, ApiProblem) as exc:
+                        message = f"微信 API 删除失败：{exc}"
+                else:
+                    message = "微信公众号未配置，跳过远程删除"
+                self._send_json(200, {"deleted": deleted, "message": message})
+                return
+
+        # --- 数据导出/导入 ---
+        if path == "/api/v2/data/export" and method == "GET":
+            self._handle_data_export()
+            return
+        if path == "/api/v2/data/import" and method == "POST":
+            self._handle_data_import()
+            return
 
         if path == "/api/v2/settings" and method == "GET":
             self._send_json(200, _mask_settings(settings_bundle()))
@@ -1137,6 +1630,288 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
 
         raise ApiProblem(404, "not_found", "接口不存在")
+
+    # -----------------------------------------------------------------------
+    # 认证端点处理方法
+    # -----------------------------------------------------------------------
+
+    def _handle_login(self) -> None:
+        """处理登录请求。"""
+        self._check_login_rate_limit()
+        body = self._read_json()
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        if not username or not password:
+            raise ApiProblem(400, "invalid_credentials", "用户名和密码不能为空")
+
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT id, username, password_hash, must_change_password, is_active FROM users WHERE username=?",
+                (username,),
+            ).fetchone()
+
+        if not row or not row["is_active"]:
+            raise ApiProblem(401, "invalid_credentials", "用户名或密码错误")
+        if not verify_password(password, row["password_hash"]):
+            raise ApiProblem(401, "invalid_credentials", "用户名或密码错误")
+
+        must_change = bool(row["must_change_password"])
+        token = create_session(row["id"], row["username"], must_change)
+
+        # 更新最后登录时间
+        with connect() as conn:
+            conn.execute(
+                "UPDATE users SET last_login_at=?, updated_at=? WHERE id=?",
+                (utc_now(), utc_now(), row["id"]),
+            )
+
+        # #154 签发 CSRF 令牌：写入 Cookie（供浏览器自动回传）并放入响应体（供前端读取）
+        csrf_token = _generate_csrf_token()
+        # 发送会话 Cookie 与 csrf_token Cookie（会话 Cookie 必须在前，保证仅读取首个 Set-Cookie 的客户端可用）
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "username": row["username"],
+                "mustChangePassword": must_change,
+                "csrfToken": csrf_token,
+            },
+            set_cookies=[build_cookie(token), _build_csrf_cookie(csrf_token)],
+        )
+
+    def _handle_session_info(self) -> None:
+        """获取当前会话状态。"""
+        token = self._get_session_token()
+        if not token:
+            self._send_json(200, {"authenticated": False})
+            return
+        session = get_session(token)
+        if not session:
+            self._send_json(
+                200,
+                {"authenticated": False},
+                set_cookies=[build_clear_cookie(), _build_clear_csrf_cookie()],
+            )
+            return
+        self._send_json(
+            200,
+            {
+                "authenticated": True,
+                "username": session["username"],
+                "mustChangePassword": session.get("must_change_password", False),
+            },
+        )
+
+    def _handle_logout(self) -> None:
+        """处理登出请求。"""
+        token = self._get_session_token()
+        if token:
+            destroy_session(token)
+        # #154 登出时同时清除会话 Cookie 与 csrf_token Cookie
+        self._send_json(
+            200,
+            {"ok": True},
+            set_cookies=[build_clear_cookie(), _build_clear_csrf_cookie()],
+        )
+
+    def _handle_change_password(self, session: dict[str, Any]) -> None:
+        """处理修改密码请求。"""
+        body = self._read_json()
+        old_password = str(body.get("oldPassword") or "")
+        new_password = str(body.get("newPassword") or "")
+        confirm_password = str(body.get("confirmPassword") or "")
+
+        if not old_password or not new_password:
+            raise ApiProblem(400, "invalid_request", "请填写旧密码和新密码")
+        if new_password != confirm_password:
+            raise ApiProblem(400, "password_mismatch", "两次输入的新密码不一致")
+
+        # 验证旧密码
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT id, password_hash FROM users WHERE id=?",
+                (session["user_id"],),
+            ).fetchone()
+        if not row or not verify_password(old_password, row["password_hash"]):
+            raise ApiProblem(401, "invalid_credentials", "旧密码不正确")
+
+        # 校验新密码强度
+        ok, message = validate_password_strength(new_password)
+        if not ok:
+            raise ApiProblem(400, "weak_password", message)
+
+        # 新密码不能与旧密码相同
+        if old_password == new_password:
+            raise ApiProblem(400, "password_reused", "新密码不能与旧密码相同")
+
+        # 更新密码
+        new_hash = hash_password(new_password)
+        with connect() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?",
+                (new_hash, utc_now(), session["user_id"]),
+            )
+
+        # 销毁该用户的所有其他会话（强制重新登录）
+        destroy_all_user_sessions(session["user_id"])
+
+        # 删除初始密码文件（已修改密码，不再需要）
+        try:
+            from db import db_path
+
+            password_file = db_path().parent / INITIAL_PASSWORD_FILE
+            if password_file.exists():
+                password_file.unlink()
+        except OSError:
+            pass
+
+        # 为当前请求创建新会话（已修改密码，无需再改）
+        token = create_session(session["user_id"], session["username"], False)
+        self._send_json(
+            200,
+            {"ok": True, "message": "密码修改成功"},
+            extra_headers={"Set-Cookie": build_cookie(token)},
+        )
+
+    # -----------------------------------------------------------------------
+    # 数据导出/导入处理方法
+    # -----------------------------------------------------------------------
+
+    def _handle_data_export(self) -> None:
+        """处理全量数据导出请求，返回 JSON 附件。"""
+        backup = export_data()
+        body = _json_bytes(backup)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"studio-backup-{timestamp}.json"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}",
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_data_import(self) -> None:
+        """处理数据导入请求。"""
+        # #190 服务端请求体大小限制（100MB），防止客户端绕过前端 100MB 检查。
+        # _read_json 内部也会校验 Content-Length，此处显式预检以给出明确错误码。
+        IMPORT_MAX_BYTES = 100 * 1024 * 1024
+        length_header = self.headers.get("Content-Length", "0")
+        try:
+            declared_length = int(length_header)
+        except ValueError as exc:
+            raise ApiProblem(400, "invalid_length", "Content-Length 无效") from exc
+        if declared_length > IMPORT_MAX_BYTES:
+            raise ApiProblem(
+                413, "payload_too_large",
+                f"导入文件超过服务端上限（{IMPORT_MAX_BYTES // (1024 * 1024)}MB）",
+            )
+        body = self._read_json(max_bytes=IMPORT_MAX_BYTES)  # 二次校验实际读取上限
+        mode = str(body.get("mode") or "merge")
+        import_ai_config = bool(body.get("importAiConfig"))
+        data = body.get("data")
+        if not data or not isinstance(data, dict):
+            raise ApiProblem(400, "invalid_request", "缺少 data 字段")
+        try:
+            counts = import_data(data, mode=mode, import_ai_config=import_ai_config)
+        except ValueError as exc:
+            raise ApiProblem(400, "invalid_backup", str(exc)) from exc
+        self._send_json(200, {"ok": True, "imported": counts})
+
+    def _handle_sse_stream(self, session_token: str | None = None) -> None:
+        """P2 审计修复：SSE 实时推送活跃任务状态。
+
+        每隔 2 秒查询一次活跃任务（status IN ('queued', 'running')），
+        以 text/event-stream 格式推送状态更新。连接保持直到客户端断开或 30 秒超时。
+        #186 周期性校验会话，过期则推送 auth 事件并关闭连接。
+        #068 周期性检查已发布文章的远程草稿过期状态并推送提醒。
+        注意：不使用 _send_json，直接发送流式响应。
+        """
+        # 手动设置响应摘要用于访问日志
+        self._resp_status = 200
+        self._resp_bytes = 0
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self._security_headers()
+        self.end_headers()
+
+        start = time.monotonic()
+        auth_checked_at = time.monotonic()
+        stale_checked_at = time.monotonic()
+        while time.monotonic() - start < 30:
+            # #186 每 5 秒重新校验会话，过期则推送 auth 事件并关闭
+            if time.monotonic() - auth_checked_at >= 5:
+                auth_checked_at = time.monotonic()
+                if not session_token or not get_session(session_token):
+                    try:
+                        payload = json.dumps(
+                            {"event": "auth_expired", "message": "会话已过期，请重新登录"},
+                            ensure_ascii=False,
+                        )
+                        self.wfile.write(f"event: auth\ndata: {payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass
+                    break
+            # #068 每 10 秒检查已发布文章的远程草稿过期状态
+            if time.monotonic() - stale_checked_at >= 10:
+                stale_checked_at = time.monotonic()
+                try:
+                    stale_projects = _check_published_stale_status()
+                    if stale_projects:
+                        payload = json.dumps(
+                            {"event": "publish_stale", "items": stale_projects},
+                            ensure_ascii=False,
+                        )
+                        self.wfile.write(f"event: publish_stale\ndata: {payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    break
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                with connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT id, status, current_step, progress, message
+                        FROM tasks WHERE status IN ('queued', 'running')
+                        ORDER BY updated_at DESC LIMIT 50
+                        """
+                    ).fetchall()
+                if rows:
+                    for row in rows:
+                        payload = json.dumps(
+                            {
+                                "taskId": row["id"],
+                                "status": row["status"],
+                                "step": row["current_step"],
+                                "progress": int(row["progress"]),
+                                "message": row["message"],
+                            },
+                            ensure_ascii=False,
+                        )
+                        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                else:
+                    # 没有活跃任务，发送心跳保持连接
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # 客户端已断开连接
+                break
+            except Exception:  # noqa: BLE001
+                # 查询出错时发送心跳，不中断连接
+                try:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    break
+            time.sleep(2)
 
     def _require_current_revision(self, project: dict[str, Any]) -> int:
         supplied = self.headers.get("If-Match", "").strip().strip('"')
@@ -1260,6 +2035,46 @@ class StudioHandler(BaseHTTPRequestHandler):
                 current = conn.execute("SELECT * FROM projects WHERE id=?", (project["id"],)).fetchone()
                 raise ApiProblem(409, "revision_conflict", "文章已被其他操作修改", {"server": row_to_project(current)})
         self._send_json(200, get_project(project["id"]))
+
+    def _upload_cover(self, project: dict[str, Any]) -> None:
+        """#169 独立的封面上传端点，避免大体积 base64 封面导致 PATCH 超时。"""
+        if project["deleted"]:
+            raise KeyError("文章不存在")
+        self._require_current_revision(project)
+        body = self._read_json(max_bytes=3_500_000)
+        cover_url = _require_text(str(body.get("coverDataUrl") or ""), "封面", 3_000_000, allow_empty=False)
+        _parse_cover_data_url(cover_url)  # 校验封面格式与大小，非法时抛出 ApiProblem
+        with connect() as conn:
+            record_project_version(conn, project["id"], "封面上传前")
+            cursor = conn.execute(
+                "UPDATE projects SET cover_data_url=?, review_approved=0, review_revision=0, reviewed_at='', "
+                "publish_status='not_synced', publish_remote_id='', published_revision=0, "
+                "publish_fingerprint='', publish_preview_hash='', revision=revision+1, updated_at=? "
+                "WHERE id=? AND revision=?",
+                (cover_url, utc_now(), project["id"], project["revision"]),
+            )
+            if cursor.rowcount != 1:
+                raise ApiProblem(409, "revision_conflict", "封面上传时文章版本已变化")
+        self._send_json(200, get_project(project["id"]))
+
+    def _generate_summary(self, project: dict[str, Any]) -> None:
+        """#125 AI 摘要生成：根据正文生成摘要供前端编辑使用。"""
+        if project["deleted"]:
+            raise KeyError("文章不存在")
+        if not bool(get_setting("general").get("allowNetwork", True)) and not _test_adapter_enabled("STUDIO_TEST_AI"):
+            raise ApiProblem(409, "network_disabled", "联网能力已关闭，不能生成 AI 摘要")
+        ai_config = get_setting("ai")
+        if not (bool(ai_config.get("apiKey")) or _test_adapter_enabled("STUDIO_TEST_AI")):
+            raise ApiProblem(400, "ai_not_configured", "请先在设置中配置 AI 模型")
+        body_markdown = str(project.get("bodyMarkdown") or "")
+        if not body_markdown.strip():
+            raise ApiProblem(400, "body_required", "正文为空，无法生成摘要")
+        engine = AIEngine(ai_config)
+        try:
+            summary = engine.summarize(body_markdown)
+        except AIEngineError as exc:
+            raise ApiProblem(400, exc.code, str(exc)) from exc
+        self._send_json(200, {"summary": summary})
 
     def _copy_project(self, project: dict[str, Any]) -> dict[str, Any]:
         new_id = "prj_" + uuid.uuid4().hex[:20]
@@ -1387,9 +2202,40 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
 
+def _ensure_login_attempts_table() -> None:
+    """S3 审计修复：创建登录尝试记录表（数据库持久化限流）。"""
+    with connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_attempts(
+                ip TEXT NOT NULL,
+                attempted_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts(ip, attempted_at)"
+        )
+
+
+def _warn_test_adapters() -> None:
+    """P0-1: 启动时检测测试适配器标记文件并警告。"""
+    marker = Path(__file__).resolve().parent.parent / ".test-adapters-enabled"
+    if not marker.exists():
+        return
+    if os.environ.get("STUDIO_ENABLE_TEST_ADAPTERS") == "1":
+        logger.warning("⚠️ 测试适配器已激活（STUDIO_ENABLE_TEST_ADAPTERS=1），AI/微信/内容安全校验将被绕过！仅限开发测试环境使用。")
+    else:
+        logger.warning("⚠️ 检测到 .test-adapters-enabled 标记文件，但 STUDIO_ENABLE_TEST_ADAPTERS 未设置。测试适配器未激活。建议在生产部署中删除此文件。")
+
+
 def create_server(host: str, port: int) -> ThreadingHTTPServer:
+    _warn_test_adapters()
     validate_runtime_security(host)
     init_db()
+    _ensure_login_attempts_table()
+    ensure_initial_user()
+    cleanup_expired_sessions()
     mark_interrupted_tasks()
     return ThreadingHTTPServer((host, port), StudioHandler)
 
@@ -1397,7 +2243,7 @@ def create_server(host: str, port: int) -> ThreadingHTTPServer:
 def main() -> None:
     parser = argparse.ArgumentParser(description="公众号 AI Studio 2.1.3")
     parser.add_argument("--host", default=os.environ.get("STUDIO_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("STUDIO_PORT", "5000")))
+    parser.add_argument("--port", type=int, default=_env_int("STUDIO_PORT", 5000))
     args = parser.parse_args()
     validate_runtime_security(args.host)
     server = create_server(args.host, args.port)
@@ -1407,6 +2253,18 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            from workflow import shutdown_executor
+            shutdown_executor()
+            logger.info("工作流线程池已关闭")
+        except Exception:
+            pass
+        try:
+            from db import stop_wal_checkpoint_thread
+            stop_wal_checkpoint_thread()
+            logger.info("WAL checkpoint 线程已停止")
+        except Exception:
+            pass
         server.server_close()
 
 

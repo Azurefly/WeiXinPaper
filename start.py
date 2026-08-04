@@ -16,7 +16,11 @@ from server import VERSION, create_server  # noqa: E402
 
 def main() -> None:
     host = os.environ.get("STUDIO_HOST", "127.0.0.1")
-    port = int(os.environ.get("STUDIO_PORT", "5000"))
+    # P1-24: 端口解析失败时回退到默认值 5000，避免启动崩溃
+    try:
+        port = int(os.environ.get("STUDIO_PORT", "5000"))
+    except (TypeError, ValueError):
+        port = 5000
     validate_runtime_security(host)
     server = create_server(host, port)
     url_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host

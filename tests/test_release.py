@@ -32,26 +32,35 @@ def free_port() -> int:
 class Client:
     def __init__(self, base: str):
         self.base = base
+        self.cookie: str | None = None
 
-    def request(self, path: str, method: str = "GET", body=None, headers=None):
+    def request(self, path: str, method: str = "GET", body=None, headers=None, timeout=10):
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": self.base,
+            "Host": urllib.parse.urlsplit(self.base).hostname + ":"
+                + str(urllib.parse.urlsplit(self.base).port),
+            **(headers or {}),
+        }
+        if self.cookie:
+            request_headers["Cookie"] = self.cookie
         request = urllib.request.Request(
             self.base + path,
             data=data,
             method=method,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Origin": self.base,
-                "Host": urllib.parse.urlsplit(self.base).hostname + ":"
-                    + str(urllib.parse.urlsplit(self.base).port),
-                **(headers or {}),
-            },
+            headers=request_headers,
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read()
                 content_type = response.headers.get("Content-Type", "")
+                # 捕获 Set-Cookie
+                set_cookie = response.headers.get("Set-Cookie")
+                if set_cookie:
+                    # 提取 cookie 名值对（分号前的部分）
+                    self.cookie = set_cookie.split(";")[0]
                 value = json.loads(raw) if "json" in content_type else raw.decode("utf-8")
                 return response.status, value, response.headers
         except urllib.error.HTTPError as exc:
@@ -114,6 +123,30 @@ def running_server(*, timeout_seconds: int = 1200, delay: float = 0.0, extra_env
             time.sleep(0.05)
         else:
             raise RuntimeError("server did not start")
+
+        # 认证：读取初始密码 → 登录 → 修改密码（移除 must_change 标志）
+        password_file = Path(temp.name) / ".initial_password"
+        if password_file.exists():
+            initial_password = password_file.read_text(encoding="utf-8").strip()
+            if initial_password:
+                status, login_data, _ = client.request(
+                    "/api/v2/auth/login",
+                    method="POST",
+                    body={"username": "admin", "password": initial_password},
+                )
+                if status == 200 and login_data.get("ok"):
+                    # 修改密码以移除 must_change_password 标志
+                    new_password = "TestPass123!"
+                    client.request(
+                        "/api/v2/auth/change-password",
+                        method="POST",
+                        body={
+                            "oldPassword": initial_password,
+                            "newPassword": new_password,
+                            "confirmPassword": new_password,
+                        },
+                    )
+
         yield client, Path(temp.name) / "studio.db", base
     finally:
         process.terminate()

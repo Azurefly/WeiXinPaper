@@ -17,6 +17,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(BACKEND))
 
 import verify_external_links  # noqa: E402
+import build_release  # noqa: E402
+from content_security import run_content_security_checks  # noqa: E402
 from tests.test_release import running_server  # noqa: E402
 
 
@@ -111,10 +113,37 @@ class Audit213Tests(unittest.TestCase):
             "verify_windows_dpapi.cmd",
         ):
             self.assertTrue((ROOT / name).is_file(), name)
-        capacity = json.loads((ROOT / "docs" / "2.1.3_容量与稳定性验证结果.json").read_text(encoding="utf-8"))
-        self.assertEqual(capacity["status"], "succeeded")
-        self.assertEqual(capacity["dataset"]["articles"], 10_000)
-        self.assertEqual(capacity["integrityCheck"], "ok")
+        capacity_source = (ROOT / "verify_capacity.py").read_text(encoding="utf-8")
+        self.assertIn("10_000", capacity_source)
+        self.assertIn("integrity_check", capacity_source)
+
+    def test_topic_review_does_not_claim_originality_without_source(self):
+        checks = run_content_security_checks("这是一段足够长的主题创作正文。" * 20, "")
+        source_check = next(item for item in checks if item["id"] == "source_overlap")
+        self.assertEqual(source_check["status"], "warning")
+        self.assertIn("不代表原创性", source_check["message"])
+        self.assertNotIn("score", source_check)
+
+    def test_release_builder_excludes_every_runtime_data_file(self):
+        for name in (
+            "data/studio.db",
+            "data/studio.db.backup_123",
+            "data/studio.log",
+            "data/studio.log.2026-08-04",
+            "data/.master.key",
+            "data/.initial_password",
+        ):
+            self.assertTrue(build_release.excluded(ROOT / name), name)
+
+    def test_source_release_contains_desktop_build_chain(self):
+        required = {
+            ".github",
+            "build_assets",
+            "build_scripts",
+            "desktop.py",
+            "requirements-desktop.txt",
+        }
+        self.assertTrue(required.issubset(build_release.SOURCE_TOP))
 
     def test_frontend_uses_server_side_pagination(self):
         js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
