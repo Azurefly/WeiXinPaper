@@ -162,6 +162,10 @@ class DesktopReleaseTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertLess(source.index("server_thread.start()"), source.index("import webview"))
+        self.assertIn(
+            "lock_sock = None if server_only else acquire_single_instance_lock()",
+            source,
+        )
 
     def test_build_console_replaces_unencodable_status_characters(self):
         stdout = mock.Mock()

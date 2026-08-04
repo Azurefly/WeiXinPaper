@@ -517,9 +517,11 @@ def main() -> None:
     # 1. 配置环境（数据/日志目录 + 迁移）
     data_dir = configure_environment()
 
-    # 2. 单实例检查
-    lock_sock = acquire_single_instance_lock()
-    if lock_sock is None:
+    # 2. 单实例检查。server-only 是由构建/诊断程序管理的无界面
+    # 进程，已通过 STUDIO_PORT 独占随机端口；若再绑定固定桌面锁
+    # 端口，Windows Runner 的动态端口保留会触发不可见的模态弹窗。
+    lock_sock = None if server_only else acquire_single_instance_lock()
+    if not server_only and lock_sock is None:
         show_warning(APP_TITLE, "程序已在运行中，请勿重复启动。")
         sys.exit(0)
 
@@ -554,7 +556,6 @@ def main() -> None:
             server.serve_forever(poll_interval=0.2)
         finally:
             server.server_close()
-            lock_sock.close()
         return
 
     # 5. 后端先启动，再导入 GUI 运行时。Windows 上 pythonnet/WebView2 的
@@ -575,7 +576,8 @@ def main() -> None:
         import webview
     except ImportError:
         shutdown_server(server)
-        lock_sock.close()
+        if lock_sock is not None:
+            lock_sock.close()
         show_error(APP_TITLE, "缺少 pywebview 依赖。\n\n请运行：\npip install pywebview")
         sys.exit(1)
 
@@ -668,7 +670,8 @@ def main() -> None:
     nav_stop.set()
     shutdown_server(server)
     try:
-        lock_sock.close()
+        if lock_sock is not None:
+            lock_sock.close()
     except Exception:  # noqa: BLE001
         pass
     print(f"{APP_TITLE} 已退出。")
