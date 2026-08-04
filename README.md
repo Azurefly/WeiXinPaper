@@ -9,7 +9,6 @@
 | 平台 | 文件 | 使用方式 |
 | --- | --- | --- |
 | macOS Apple Silicon | `WeiXinGZH-AI-Studio-2.1.3-macOS-arm64.zip` | 解压后将 App 拖入「应用程序」，首次启动右键选择「打开」 |
-| macOS Intel | `WeiXinGZH-AI-Studio-2.1.3-macOS-x86_64.zip` | 解压后将 App 拖入「应用程序」，首次启动右键选择「打开」 |
 | Windows 10/11 x64 | `WeiXinGZH-AI-Studio-2.1.3-Windows-x64.zip` | 解压完整目录，双击 `公众号 AI Studio.exe` |
 
 macOS 包采用 ad-hoc 签名，已通过 `codesign --deep --strict` 校验，但未使用 Apple Developer ID 公证。Windows 包包含完整运行时和图标，不要只复制 `.exe`，必须保留 `_internal` 目录。可用 Release 中的 `SHA256SUMS.txt` 校验下载文件。
