@@ -181,6 +181,17 @@ class DesktopReleaseTests(unittest.TestCase):
         stdout.reconfigure.assert_called_once_with(errors="replace")
         stderr.reconfigure.assert_called_once_with(errors="replace")
 
+    def test_desktop_console_uses_utf8_before_backend_import(self):
+        stdout = mock.Mock()
+        stderr = mock.Mock()
+        with (
+            mock.patch.object(desktop.sys, "stdout", stdout),
+            mock.patch.object(desktop.sys, "stderr", stderr),
+        ):
+            desktop.configure_console()
+        stdout.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+        stderr.reconfigure.assert_called_once_with(encoding="utf-8", errors="replace")
+
 
 if __name__ == "__main__":
     unittest.main()

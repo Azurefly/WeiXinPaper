@@ -94,6 +94,17 @@ ERROR_HTML_TEMPLATE = """\
 """
 
 
+def configure_console() -> None:
+    """Windows 重定向输出默认 cp1252，桌面端中文日志必须显式用 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def _trace_startup(message: str) -> None:
     """仅在显式配置时写入无界面启动轨迹，供打包验收诊断。"""
     configured = os.environ.get("STUDIO_STARTUP_TRACE_FILE", "").strip()
@@ -525,6 +536,7 @@ def shutdown_server(server: object) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    configure_console()
     debug = "--debug" in sys.argv
     server_only = "--server-only" in sys.argv
     _trace_startup("main-entered")
