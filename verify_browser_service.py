@@ -176,15 +176,11 @@ def run_validation() -> dict[str, Any]:
                         "message": message[:800],
                     }
                 expect(page).to_have_title("公众号 AI Studio")
-                initial_password = (temp_root / ".initial_password").read_text(encoding="utf-8").strip()
-                page.locator("#login-password").fill(initial_password)
-                page.locator("#login-form").press("Enter")
-                expect(page.locator("#change-password-form")).to_be_visible()
-                new_password = "StudioBrowser9A"
-                page.locator("#cp-old").fill(initial_password)
-                page.locator("#cp-new").fill(new_password)
-                page.locator("#cp-confirm").fill(new_password)
-                page.locator("#change-password-form").press("Enter")
+                setup_password = "StudioBrowser9A"
+                expect(page.locator("#admin-setup-form")).to_be_visible()
+                page.locator("#setup-password").fill(setup_password)
+                page.locator("#setup-confirm").fill(setup_password)
+                page.locator("#admin-setup-form").press("Enter")
                 expect(page.locator("nav.nav button")).to_have_count(5)
                 page.evaluate("location.hash = '#/articles'")
                 expect(page.get_by_text("真实服务浏览器验收文章", exact=True)).to_be_visible()

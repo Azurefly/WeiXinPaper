@@ -179,26 +179,18 @@ def run_validation(article_count: int, edit_count: int) -> dict[str, Any]:
         try:
             client = Client(base)
             wait_server(client, process)
-            initial_password = (temp_root / ".initial_password").read_text(encoding="utf-8").strip()
-            status, login, _ = client.request(
-                "/api/v2/auth/login",
-                method="POST",
-                body={"username": "admin", "password": initial_password},
-            )
-            if status != 200 or not login.get("ok"):
-                raise RuntimeError(f"capacity login failed: status={status}, payload={login}")
-            new_password = "CapacityStudio9A"
-            status, changed, _ = client.request(
-                "/api/v2/auth/change-password",
+            setup_password = "CapacityStudio9A"
+            status, setup, _ = client.request(
+                "/api/v2/auth/setup",
                 method="POST",
                 body={
-                    "oldPassword": initial_password,
-                    "newPassword": new_password,
-                    "confirmPassword": new_password,
+                    "username": "admin",
+                    "password": setup_password,
+                    "confirmPassword": setup_password,
                 },
             )
-            if status != 200 or not changed.get("ok"):
-                raise RuntimeError(f"capacity password change failed: status={status}, payload={changed}")
+            if status != 201 or not setup.get("ok"):
+                raise RuntimeError(f"capacity admin setup failed: status={status}, payload={setup}")
             initial_rss = rss_mb(process.pid)
             status, first, first_ms = client.request("/api/v2/projects?includeArchived=false&limit=50&offset=0")
             if status != 200 or first.get("total") != article_count or len(first.get("items") or []) != 50:

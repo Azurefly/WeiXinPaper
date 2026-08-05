@@ -10,13 +10,14 @@
 - 预览和微信提交共用服务端 HTML 消毒器。封面上传验证 MIME、文件签名、解码结果和大小。
 - 访问日志只记录路径、状态、耗时和字节数，不记录请求/响应正文。标准输出、文件日志、内存日志和异常栈统一脱敏。
 - 500 响应不向客户端暴露 Python `repr`、文件路径或 SQL 细节。
+- 管理员只能在无用户或旧版随机密码 admin 从未登录时初始化；完成后初始化接口永久返回冲突，不提供公开注册。
 
 ## 部署要求
 
 1. 不要把内置服务监听到 `0.0.0.0`。
 2. 远程模式必须设置 `STUDIO_PUBLIC_ORIGIN`、强随机 `STUDIO_AUTH_PASSWORD` 和受信任 HTTPS 证书。
 3. 反向代理需保留公开 `Host`，并将 Basic Auth `Authorization` 头传给回环后端。
-4. 不要提交 `data/`、`.master.key`、`.initial_password`、数据库、日志或备份导出文件。
+4. 不要提交 `data/`、`.master.key`、旧版可能遗留的 `.initial_password`、数据库、日志或备份导出文件。
 5. 定期更换 AI/微信凭证，并复核 `data/studio.log` 的访问权限。
 
 ## 安全边界

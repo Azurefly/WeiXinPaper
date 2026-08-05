@@ -81,7 +81,13 @@ class Client:
 
 
 @contextmanager
-def running_server(*, timeout_seconds: int = 1200, delay: float = 0.0, extra_env: dict[str, str] | None = None):
+def running_server(
+    *,
+    timeout_seconds: int = 1200,
+    delay: float = 0.0,
+    extra_env: dict[str, str] | None = None,
+    auto_setup: bool = True,
+):
     temp = tempfile.TemporaryDirectory()
     port = free_port()
     env = os.environ.copy()
@@ -124,28 +130,19 @@ def running_server(*, timeout_seconds: int = 1200, delay: float = 0.0, extra_env
         else:
             raise RuntimeError("server did not start")
 
-        # 认证：读取初始密码 → 登录 → 修改密码（移除 must_change 标志）
-        password_file = Path(temp.name) / ".initial_password"
-        if password_file.exists():
-            initial_password = password_file.read_text(encoding="utf-8").strip()
-            if initial_password:
-                status, login_data, _ = client.request(
-                    "/api/v2/auth/login",
-                    method="POST",
-                    body={"username": "admin", "password": initial_password},
-                )
-                if status == 200 and login_data.get("ok"):
-                    # 修改密码以移除 must_change_password 标志
-                    new_password = "TestPass123!"
-                    client.request(
-                        "/api/v2/auth/change-password",
-                        method="POST",
-                        body={
-                            "oldPassword": initial_password,
-                            "newPassword": new_password,
-                            "confirmPassword": new_password,
-                        },
-                    )
+        if auto_setup:
+            status, setup, _ = client.request("/api/v2/auth/setup")
+            assert status == 200 and setup["needsSetup"] is True
+            status, created, _ = client.request(
+                "/api/v2/auth/setup",
+                method="POST",
+                body={
+                    "username": "admin",
+                    "password": "TestPass123!",
+                    "confirmPassword": "TestPass123!",
+                },
+            )
+            assert status == 201 and created["ok"] is True
 
         yield client, Path(temp.name) / "studio.db", base
     finally:
@@ -181,6 +178,77 @@ class ReleaseTests(unittest.TestCase):
         status, project, _ = self.client.request(f"/api/v2/projects/{result['project']['id']}")
         self.assertEqual(status, 200)
         return project, task
+
+    def test_00_first_run_setup_and_legacy_admin_recovery(self):
+        with running_server(auto_setup=False) as (client, db_path, _):
+            status, setup, _ = client.request("/api/v2/auth/setup")
+            self.assertEqual(status, 200)
+            self.assertTrue(setup["needsSetup"])
+            self.assertFalse((db_path.parent / ".initial_password").exists())
+
+            status, weak, _ = client.request(
+                "/api/v2/auth/setup",
+                "POST",
+                {"username": "admin", "password": "weak", "confirmPassword": "weak"},
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(weak["error"]["code"], "weak_password")
+
+            status, created, _ = client.request(
+                "/api/v2/auth/setup",
+                "POST",
+                {
+                    "username": "owner",
+                    "password": "OwnerPass123!",
+                    "confirmPassword": "OwnerPass123!",
+                },
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(created["username"], "owner")
+            self.assertFalse(created["mustChangePassword"])
+
+            status, session, _ = client.request("/api/v2/auth/session")
+            self.assertEqual(status, 200)
+            self.assertTrue(session["authenticated"])
+            self.assertEqual(session["username"], "owner")
+            status, setup, _ = client.request("/api/v2/auth/setup")
+            self.assertFalse(setup["needsSetup"])
+            status, duplicate, _ = client.request(
+                "/api/v2/auth/setup",
+                "POST",
+                {
+                    "username": "another",
+                    "password": "AnotherPass123!",
+                    "confirmPassword": "AnotherPass123!",
+                },
+            )
+            self.assertEqual(status, 409)
+            self.assertEqual(duplicate["error"]["code"], "already_initialized")
+
+        with running_server(auto_setup=False) as (client, db_path, _):
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO users(id, username, password_hash, must_change_password, is_active, created_at, updated_at) "
+                    "VALUES('usr_legacy', 'admin', 'unavailable-random-password', 1, 1, '2026-01-01', '2026-01-01')"
+                )
+                conn.commit()
+            legacy_file = db_path.parent / ".initial_password"
+            legacy_file.write_text("lost-password", encoding="utf-8")
+            status, setup, _ = client.request("/api/v2/auth/setup")
+            self.assertEqual(status, 200)
+            self.assertTrue(setup["needsSetup"])
+            status, recovered, _ = client.request(
+                "/api/v2/auth/setup",
+                "POST",
+                {
+                    "username": "admin",
+                    "password": "RecoveredPass123!",
+                    "confirmPassword": "RecoveredPass123!",
+                },
+            )
+            self.assertEqual(status, 201)
+            self.assertTrue(recovered["ok"])
+            self.assertFalse(legacy_file.exists())
 
     def test_01_static_and_bootstrap_are_real(self):
         status, html, headers = self.client.request("/")

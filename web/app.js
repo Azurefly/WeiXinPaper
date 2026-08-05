@@ -5,6 +5,7 @@ const DRAFT_STORAGE_KEY = 'studio-form-drafts';
 const state = {
   loading: true,
   fatal: '',
+  setupRequired: false,
   auth: { authenticated: false, mustChangePassword: false, username: '', csrfToken: '' },
   projects: [],
   projectCounts: { active: 0, all: 0, deleted: 0 },
@@ -278,6 +279,14 @@ async function bootstrap() {
   state.loading = true;
   render();
   try {
+    // 首次启动先进入一次性管理员初始化，不依赖隐藏密码文件。
+    const setupInfo = await api('/api/v2/auth/setup');
+    state.setupRequired = !!setupInfo.needsSetup;
+    if (state.setupRequired) {
+      state.auth = { authenticated: false, mustChangePassword: false, username: '', csrfToken: '' };
+      state.fatal = '';
+      return;
+    }
     // 先检查会话状态
     const sessionInfo = await api('/api/v2/auth/session');
     state.auth = {
@@ -1740,8 +1749,94 @@ function renderTasks() {
 }
 
 // ---------------------------------------------------------------------------
-// 认证页面：登录 & 修改密码
+// 认证页面：首次初始化、登录 & 修改密码
 // ---------------------------------------------------------------------------
+
+function renderAdminSetup() {
+  return `
+    <div class="auth-page">
+      <div class="auth-card">
+        <div class="auth-brand">
+          <div class="auth-logo">✦</div>
+          <h1>初始化管理员</h1>
+          <p>第一次使用，请设置您自己的登录信息</p>
+        </div>
+        <form id="admin-setup-form" class="auth-form" autocomplete="off">
+          <div class="auth-field">
+            <label for="setup-username">管理员用户名</label>
+            <input type="text" id="setup-username" name="username" required autocomplete="username"
+                   minlength="3" maxlength="32" value="admin" />
+          </div>
+          <div class="auth-field">
+            <label for="setup-password">登录密码</label>
+            <input type="password" id="setup-password" name="password" required autocomplete="new-password"
+                   placeholder="至少 8 位，含大小写字母和数字" />
+          </div>
+          <div class="auth-field">
+            <label for="setup-confirm">确认密码</label>
+            <input type="password" id="setup-confirm" name="confirmPassword" required autocomplete="new-password"
+                   placeholder="请再次输入密码" />
+          </div>
+          <button type="submit" class="btn btn-primary auth-submit" id="setup-button">创建管理员并进入工作台</button>
+        </form>
+        <div class="auth-hint" id="setup-hint"></div>
+        <div class="auth-rules">
+          <p>说明：</p>
+          <ul>
+            <li>该页面只在未初始化时出现，完成后永久关闭</li>
+            <li>密码至少 8 位，必须包含大写字母、小写字母和数字</li>
+            <li>请自行妥善保存密码，系统不再生成或显示隐藏初始密码</li>
+          </ul>
+        </div>
+      </div>
+    </div>`;
+}
+
+function bindAdminSetup() {
+  const form = document.getElementById('admin-setup-form');
+  const button = document.getElementById('setup-button');
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const username = document.getElementById('setup-username').value.trim();
+    const password = document.getElementById('setup-password').value;
+    const confirmPassword = document.getElementById('setup-confirm').value;
+    const hint = document.getElementById('setup-hint');
+    if (password !== confirmPassword) {
+      hint.textContent = '两次输入的密码不一致';
+      hint.className = 'auth-hint error';
+      return;
+    }
+    button.disabled = true;
+    button.textContent = '正在初始化…';
+    hint.textContent = '';
+    hint.className = 'auth-hint';
+    try {
+      const result = await api('/api/v2/auth/setup', {
+        method: 'POST',
+        body: { username, password, confirmPassword },
+      });
+      state.setupRequired = false;
+      state.auth = {
+        authenticated: true,
+        mustChangePassword: false,
+        username: result.username || username,
+        csrfToken: result.csrfToken || '',
+      };
+      toast('管理员初始化完成', 'success');
+      await bootstrap();
+    } catch (error) {
+      if (error.code === 'already_initialized') {
+        state.setupRequired = false;
+        await bootstrap();
+        return;
+      }
+      hint.textContent = error.message || '初始化失败';
+      hint.className = 'auth-hint error';
+      button.disabled = false;
+      button.textContent = '创建管理员并进入工作台';
+    }
+  });
+}
 
 function renderLogin() {
   return `
@@ -1804,6 +1899,11 @@ function bindLogin() {
         await bootstrap();
       }
     } catch (error) {
+      if (error.code === 'setup_required') {
+        state.setupRequired = true;
+        render();
+        return;
+      }
       hint.textContent = error.message || '登录失败';
       hint.className = 'auth-hint error';
       button.disabled = false;
@@ -2161,6 +2261,11 @@ function render() {
   if (state.fatal) {
     app.innerHTML = `<div class="loading-screen"><div class="card card-pad"><div class="alert error"><strong>无法启动工作台</strong><br>${escapeHtml(state.fatal)}</div><br><button class="btn btn-primary" id="fatal-retry">重新连接</button></div></div>`;
     document.getElementById('fatal-retry')?.addEventListener('click', bootstrap);
+    return;
+  }
+  if (state.setupRequired) {
+    app.innerHTML = renderAdminSetup();
+    bindAdminSetup();
     return;
   }
   // 未认证 → 显示登录页

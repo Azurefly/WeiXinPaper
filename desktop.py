@@ -642,20 +642,6 @@ def main() -> None:
 
     def _navigate_when_ready() -> None:
         if wait_for_server(url, timeout=SERVER_START_TIMEOUT):
-            # 检查是否有初始密码需要展示（首次启动）
-            try:
-                from db import db_path
-                password_file = db_path().parent / ".initial_password"
-                if password_file.exists():
-                    password = password_file.read_text(encoding="utf-8").strip()
-                    if password:
-                        _show_dialog(
-                            "info",
-                            APP_TITLE,
-                            f"首次启动已创建管理员账户\n\n用户名: admin\n初始密码: {password}\n\n请在登录后修改密码。",
-                        )
-            except Exception:  # noqa: BLE001
-                pass
             try:
                 window.load_url(url)
             except Exception:  # noqa: BLE001

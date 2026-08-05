@@ -116,6 +116,15 @@ class Audit213Tests(unittest.TestCase):
         capacity_source = (ROOT / "verify_capacity.py").read_text(encoding="utf-8")
         self.assertIn("10_000", capacity_source)
         self.assertIn("integrity_check", capacity_source)
+        onboarding_markers = {
+            "verify_capacity.py": "/api/v2/auth/setup",
+            "verify_browser_service.py": "#admin-setup-form",
+            "test_runtime.py": "/api/v2/auth/setup",
+        }
+        for name, marker in onboarding_markers.items():
+            source = (ROOT / name).read_text(encoding="utf-8")
+            self.assertIn(marker, source, name)
+            self.assertNotIn(' / ".initial_password"', source, name)
 
     def test_topic_review_does_not_claim_originality_without_source(self):
         checks = run_content_security_checks("这是一段足够长的主题创作正文。" * 20, "")

@@ -1,4 +1,4 @@
-"""密码哈希、验证、强度校验与随机生成。
+"""密码哈希、验证与强度校验。
 
 使用 PBKDF2-HMAC-SHA256（600000 轮迭代）对密码进行加盐哈希，
 存储格式为 `pbkdf2_sha256$iterations$salt_hex$hash_hex`。
@@ -8,17 +8,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
-import string
 
 # PBKDF2 参数
 _PBKDF2_ALGORITHM = "sha256"
 _PBKDF2_ROUNDS = 600_000
 _PBKDF2_DKLEN = 32
-
-# 随机密码字符集（排除易混淆字符 0/O/o/1/l/I）
-_PASSWORD_CHARS = string.ascii_letters + string.digits + "!@#$%^&*"
-_PASSWORD_EXCLUDE = set("0Oo1lI")
-_PASSWORD_POOL = "".join(c for c in _PASSWORD_CHARS if c not in _PASSWORD_EXCLUDE)
 
 # 密码强度要求
 MIN_PASSWORD_LENGTH = 8
@@ -68,29 +62,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
         return hmac.compare_digest(expected, actual)
     except (ValueError, AttributeError, TypeError):
         return False
-
-
-def generate_random_password(length: int = 16) -> str:
-    """生成符合强度要求的随机密码。
-
-    保证至少包含大写字母、小写字母、数字和特殊字符各一个。
-    """
-    if length < MIN_PASSWORD_LENGTH:
-        length = MIN_PASSWORD_LENGTH
-
-    # 确保至少包含每类字符一个
-    guaranteed = [
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.digits),
-        secrets.choice("!@#$%^&*"),
-    ]
-    # 剩余字符从完整池中随机选取
-    remaining = [secrets.choice(_PASSWORD_POOL) for _ in range(length - len(guaranteed))]
-    pool = guaranteed + remaining
-    # 打乱顺序
-    secrets.SystemRandom().shuffle(pool)
-    return "".join(pool)
 
 
 def validate_password_strength(password: str) -> tuple[bool, str]:

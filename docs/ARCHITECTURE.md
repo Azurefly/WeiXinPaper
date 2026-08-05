@@ -32,6 +32,7 @@ queued → running → succeeded
 
 ## 主要 API 边界
 
+- `/api/v2/auth/setup`：仅无用户或旧版未领取 admin 可用的一次性初始化。
 - `/api/v2/auth/*`：登录、改密、会话与退出。
 - `/api/v2/workflows`：唯一新建内容入口。
 - `/api/v2/projects/*`：编辑、版本、预览、终审和发布。

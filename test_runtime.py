@@ -78,24 +78,17 @@ def main() -> None:
                 html = response.read().decode("utf-8")
             assert "公众号 AI Studio" in html
             client = Client(base)
-            initial_password = (Path(temp) / ".initial_password").read_text(encoding="utf-8").strip()
-            status, login = client.request(
-                "/api/v2/auth/login",
-                "POST",
-                {"username": "admin", "password": initial_password},
-            )
-            assert status == 200 and login["mustChangePassword"], login
-            new_password = "RuntimeStudio9A"
-            status, changed = client.request(
-                "/api/v2/auth/change-password",
+            setup_password = "RuntimeStudio9A"
+            status, setup = client.request(
+                "/api/v2/auth/setup",
                 "POST",
                 {
-                    "oldPassword": initial_password,
-                    "newPassword": new_password,
-                    "confirmPassword": new_password,
+                    "username": "admin",
+                    "password": setup_password,
+                    "confirmPassword": setup_password,
                 },
             )
-            assert status == 200 and changed["ok"], changed
+            assert status == 201 and setup["ok"] and not setup["mustChangePassword"], setup
             status, created = client.request(
                 "/api/v2/workflows",
                 "POST",

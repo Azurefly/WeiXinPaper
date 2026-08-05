@@ -27,7 +27,6 @@ from typing import Any
 
 from ai_engine import AIEngine, AIEngineError
 from auth_password import (
-    generate_random_password,
     hash_password,
     validate_password_strength,
     verify_password,
@@ -798,56 +797,44 @@ def _check_published_stale_status() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# 用户认证：初始用户创建
+# 用户认证：一次性管理员初始化
 # ---------------------------------------------------------------------------
 
 INITIAL_USERNAME = "admin"
-INITIAL_PASSWORD_FILE = ".initial_password"
+LEGACY_INITIAL_PASSWORD_FILE = ".initial_password"
+_admin_setup_lock = threading.Lock()
 
 
-def ensure_initial_user() -> str | None:
-    """确保数据库中存在初始管理员用户。
+def _is_unclaimed_legacy_admin(rows: list[sqlite3.Row]) -> bool:
+    """识别旧版自动创建、但从未成功登录的随机密码账号。"""
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    return (
+        row["username"] == INITIAL_USERNAME
+        and bool(row["must_change_password"])
+        and not str(row["last_login_at"] or "").strip()
+    )
 
-    如果 users 表为空，创建 admin 用户并生成随机初始密码。
-    密码写入 data/.initial_password 文件并输出到控制台。
-    返回初始密码（仅首次创建时），否则返回 None。
-    """
+
+def admin_setup_required() -> bool:
+    """无用户，或仅存在旧版未领取 admin 时，允许一次性初始化。"""
     with connect() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if count > 0:
-            return None
+        rows = conn.execute(
+            "SELECT id, username, must_change_password, last_login_at "
+            "FROM users ORDER BY created_at LIMIT 2"
+        ).fetchall()
+    return not rows or _is_unclaimed_legacy_admin(rows)
 
-        password = generate_random_password(16)
-        password_hash = hash_password(password)
-        now = utc_now()
-        user_id = "usr_" + uuid.uuid4().hex[:20]
-        conn.execute(
-            "INSERT INTO users(id, username, password_hash, must_change_password, is_active, created_at, updated_at) "
-            "VALUES(?,?,?,?,1,?,?)",
-            (user_id, INITIAL_USERNAME, password_hash, 1, now, now),
-        )
 
-    # 写入初始密码文件（供桌面端读取显示）
+def _remove_legacy_initial_password() -> None:
+    """清理 2.1.3 及之前遗留的隐藏初始密码文件。"""
     try:
         from db import db_path
 
-        password_file = db_path().parent / INITIAL_PASSWORD_FILE
-        password_file.write_text(password, encoding="utf-8")
-        os.chmod(password_file, 0o600)
+        (db_path().parent / LEGACY_INITIAL_PASSWORD_FILE).unlink(missing_ok=True)
     except OSError:
         pass
-
-    # 输出到控制台
-    print("=" * 60)
-    print("初始管理员账户已创建")
-    print(f"  用户名: {INITIAL_USERNAME}")
-    print(f"  初始密码: {password}")
-    print("  首次登录后必须修改密码")
-    print("=" * 60)
-
-    access_logger.info("初始管理员用户 %s 已创建，初始密码已生成", INITIAL_USERNAME)
-    return password
-
 
 class StudioHandler(BaseHTTPRequestHandler):
     server_version = "WeiXinGZHStudio/2.1.3"
@@ -1013,8 +1000,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if self.command not in MUTATING:
             return
         request_path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
-        # 登录端点豁免：CSRF 令牌在此首次签发
-        if request_path == "/api/v2/auth/login":
+        # 登录/初始化端点豁免：CSRF 令牌在此首次签发。
+        # Origin/Host 校验仍在 _check_origin 中强制执行。
+        if request_path in {"/api/v2/auth/login", "/api/v2/auth/setup"}:
             return
         cookie_token = parse_cookie(self.headers.get("Cookie", ""), CSRF_COOKIE_NAME)
         if not cookie_token:
@@ -1065,17 +1053,6 @@ class StudioHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ApiProblem(400, "invalid_json", "请求 JSON 必须是对象")
         return value
-
-    # 不需要会话认证的 API 端点
-    _PUBLIC_API_PATHS = {
-        "/api/v2/auth/login",
-        "/api/v2/auth/session",
-    }
-    # 需要会话但不需要修改密码的端点
-    _PRE_PASSWORD_CHANGE_PATHS = {
-        "/api/v2/auth/logout",
-        "/api/v2/auth/change-password",
-    }
 
     def _handle(self) -> None:
         _req_start = time.monotonic()
@@ -1149,6 +1126,12 @@ class StudioHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
 
         # --- 认证端点（无需会话） ---
+        if path == "/api/v2/auth/setup" and method == "GET":
+            self._send_json(200, {"needsSetup": admin_setup_required()})
+            return
+        if path == "/api/v2/auth/setup" and method == "POST":
+            self._handle_admin_setup()
+            return
         if path == "/api/v2/auth/login" and method == "POST":
             self._handle_login()
             return
@@ -1635,8 +1618,66 @@ class StudioHandler(BaseHTTPRequestHandler):
     # 认证端点处理方法
     # -----------------------------------------------------------------------
 
+    def _handle_admin_setup(self) -> None:
+        """首次运行时创建管理员，或领取旧版未登录的随机密码 admin。"""
+        self._check_login_rate_limit()
+        body = self._read_json(max_bytes=16_384)
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        confirm_password = str(body.get("confirmPassword") or "")
+        if not re.fullmatch(r"[\w.-]{3,32}", username):
+            raise ApiProblem(400, "invalid_username", "用户名需为 3~32 位字母、数字、中文、下划线、点或连字符")
+        if password != confirm_password:
+            raise ApiProblem(400, "password_mismatch", "两次输入的密码不一致")
+        ok, message = validate_password_strength(password)
+        if not ok:
+            raise ApiProblem(400, "weak_password", message)
+
+        password_hash = hash_password(password)
+        with _admin_setup_lock:
+            with connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, username, must_change_password, last_login_at "
+                    "FROM users ORDER BY created_at LIMIT 2"
+                ).fetchall()
+                now = utc_now()
+                if not rows:
+                    user_id = "usr_" + uuid.uuid4().hex[:20]
+                    conn.execute(
+                        "INSERT INTO users(id, username, password_hash, must_change_password, is_active, created_at, updated_at) "
+                        "VALUES(?,?,?,0,1,?,?)",
+                        (user_id, username, password_hash, now, now),
+                    )
+                elif _is_unclaimed_legacy_admin(rows):
+                    user_id = rows[0]["id"]
+                    conn.execute(
+                        "UPDATE users SET username=?, password_hash=?, must_change_password=0, "
+                        "is_active=1, updated_at=? WHERE id=?",
+                        (username, password_hash, now, user_id),
+                    )
+                else:
+                    raise ApiProblem(409, "already_initialized", "管理员已初始化，请直接登录")
+
+        destroy_all_user_sessions(user_id)
+        _remove_legacy_initial_password()
+        token = create_session(user_id, username, False)
+        csrf_token = _generate_csrf_token()
+        access_logger.info("首次启动管理员 %s 已完成初始化", username)
+        self._send_json(
+            201,
+            {
+                "ok": True,
+                "username": username,
+                "mustChangePassword": False,
+                "csrfToken": csrf_token,
+            },
+            set_cookies=[build_cookie(token), _build_csrf_cookie(csrf_token)],
+        )
+
     def _handle_login(self) -> None:
         """处理登录请求。"""
+        if admin_setup_required():
+            raise ApiProblem(409, "setup_required", "请先在页面完成管理员初始化")
         self._check_login_rate_limit()
         body = self._read_json()
         username = str(body.get("username") or "").strip()
@@ -1755,15 +1796,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         # 销毁该用户的所有其他会话（强制重新登录）
         destroy_all_user_sessions(session["user_id"])
 
-        # 删除初始密码文件（已修改密码，不再需要）
-        try:
-            from db import db_path
-
-            password_file = db_path().parent / INITIAL_PASSWORD_FILE
-            if password_file.exists():
-                password_file.unlink()
-        except OSError:
-            pass
+        _remove_legacy_initial_password()
 
         # 为当前请求创建新会话（已修改密码，无需再改）
         token = create_session(session["user_id"], session["username"], False)
@@ -2234,7 +2267,6 @@ def create_server(host: str, port: int) -> ThreadingHTTPServer:
     validate_runtime_security(host)
     init_db()
     _ensure_login_attempts_table()
-    ensure_initial_user()
     cleanup_expired_sessions()
     mark_interrupted_tasks()
     return ThreadingHTTPServer((host, port), StudioHandler)
